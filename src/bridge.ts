@@ -306,14 +306,14 @@ export function createBridge(config: Config): Bridge {
     console.log("[BRIDGE] Starting Grok Build Telegram bridge...");
     connected = true;
 
-    // Try initial ACP connect (non-fatal for boot)
     try {
-      await acpClient.connect();
-    } catch (e: any) {
-      console.warn("[BRIDGE] Initial ACP connect failed (will retry on first prompt):", e.message);
-    }
+      try {
+        await acpClient.connect();
+      } catch (e: any) {
+        console.warn("[BRIDGE] Initial ACP connect failed (will retry on first prompt):", e.message);
+      }
 
-    // Start Telegram polling (grammy start does the polling loop)
+      // Start Telegram polling (grammy start does the polling loop)
     // We wrap to get update events for health
     const origStart = bot.start.bind(bot);
     bot.start = async (opts?: any) => {
@@ -355,6 +355,10 @@ export function createBridge(config: Config): Bridge {
     // (acp handle manages internally on errors in practice)
     process.on("SIGINT", () => shutdown());
     process.on("SIGTERM", () => shutdown());
+    } catch (error) {
+      await shutdown();
+      throw error;
+    }
   }
 
   async function shutdown() {
