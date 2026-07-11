@@ -37,6 +37,7 @@ export interface TelegramDeps {
 }
 
 let bot: Bot | null = null;
+let telegramToken: string | null = null;
 let sendQueue: Array<{ fn: () => Promise<any>; resolve: (v: any) => void; reject: (e: any) => void }> = [];
 let sendQueueRunning = false;
 let typingInterval: NodeJS.Timeout | null = null;
@@ -109,6 +110,11 @@ export function chunkMessage(text: string, maxLen = CHUNK_MAX): string[] {
   return chunks;
 }
 
+function getTelegramToken(): string {
+  if (!telegramToken) throw new Error("Telegram bot is not initialized");
+  return telegramToken;
+}
+
 async function callApiWithRetry(method: string, params: any, token: string): Promise<any> {
   const url = `https://api.telegram.org/bot${token}/${method}`;
   const timeoutMs = method === "getUpdates" ? 40000 : 30000;
@@ -169,19 +175,19 @@ async function drainQueue() {
 }
 
 export async function sendMessage(chatId: number, text: string, extra: any = {}) {
-  return enqueue(() => callApiWithRetry("sendMessage", { chat_id: chatId, text, ...extra }, (bot as any)._token));
+  return enqueue(() => callApiWithRetry("sendMessage", { chat_id: chatId, text, ...extra }, getTelegramToken()));
 }
 
 export async function sendFormattedMessage(chatId: number, markdown: string) {
   const html = markdownToTelegramHtml(markdown);
   try {
     return await enqueue(() =>
-      callApiWithRetry("sendMessage", { chat_id: chatId, text: html, parse_mode: "HTML" }, (bot as any)._token)
+      callApiWithRetry("sendMessage", { chat_id: chatId, text: html, parse_mode: "HTML" }, getTelegramToken())
     );
   } catch (err: any) {
     if (/can.t parse|entit/i.test(err.message || "")) {
       return await enqueue(() =>
-        callApiWithRetry("sendMessage", { chat_id: chatId, text: markdown }, (bot as any)._token)
+        callApiWithRetry("sendMessage", { chat_id: chatId, text: markdown }, getTelegramToken())
       );
     }
     throw err;
@@ -195,7 +201,7 @@ export async function editFormattedMessage(chatId: number, messageId: number, ma
       callApiWithRetry(
         "editMessageText",
         { chat_id: chatId, message_id: messageId, text: html, parse_mode: "HTML" },
-        (bot as any)._token
+        getTelegramToken()
       )
     );
   } catch (err: any) {
@@ -204,7 +210,7 @@ export async function editFormattedMessage(chatId: number, messageId: number, ma
         callApiWithRetry(
           "editMessageText",
           { chat_id: chatId, message_id: messageId, text: markdown },
-          (bot as any)._token
+          getTelegramToken()
         )
       );
     }
@@ -215,7 +221,7 @@ export async function editFormattedMessage(chatId: number, messageId: number, ma
 export async function editMessageReplyMarkup(chatId: number, messageId: number, replyMarkup: any = null) {
   const params: any = { chat_id: chatId, message_id: messageId };
   if (replyMarkup) params.reply_markup = replyMarkup;
-  return enqueue(() => callApiWithRetry("editMessageReplyMarkup", params, (bot as any)._token));
+  return enqueue(() => callApiWithRetry("editMessageReplyMarkup", params, getTelegramToken()));
 }
 
 export async function answerCallbackQuery(id: string, text?: string, showAlert = false) {
@@ -223,7 +229,7 @@ export async function answerCallbackQuery(id: string, text?: string, showAlert =
     callApiWithRetry(
       "answerCallbackQuery",
       { callback_query_id: id, text: text || "", show_alert: showAlert },
-      (bot as any)._token
+      getTelegramToken()
     )
   );
 }
@@ -233,20 +239,20 @@ export async function setMessageReaction(chatId: number, messageId: number, emoj
     callApiWithRetry(
       "setMessageReaction",
       { chat_id: chatId, message_id: messageId, reaction: [{ type: "emoji", emoji }] },
-      (bot as any)._token
+      getTelegramToken()
     )
   );
 }
 
 export async function sendChatAction(chatId: number, action = "typing") {
   return enqueue(() =>
-    callApiWithRetry("sendChatAction", { chat_id: chatId, action }, (bot as any)._token)
+    callApiWithRetry("sendChatAction", { chat_id: chatId, action }, getTelegramToken())
   );
 }
 
 export function deleteMessage(chatId: number, messageId: number) {
   return enqueue(() =>
-    callApiWithRetry("deleteMessage", { chat_id: chatId, message_id: messageId }, (bot as any)._token)
+    callApiWithRetry("deleteMessage", { chat_id: chatId, message_id: messageId }, getTelegramToken())
   ).catch(() => {});
 }
 
@@ -458,7 +464,8 @@ export function updateToolCall(toolCallId: string, status?: string) {
 }
 
 export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
-  bot = new Bot(config.TELEGRAM_BOT_TOKEN);
+  telegramToken = config.TELEGRAM_BOT_TOKEN;
+  bot = new Bot(telegramToken);
   bot.use(async (_ctx, next) => {
     deps.onUpdate?.();
     await next();
@@ -630,9 +637,7 @@ export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
     }
 
     // ack + start
-    try {
-      if (message.message_id) await setMessageReaction(chatId, message.message_id, "👀");
-    } catch {}
+    if (message.message_id) void setMessageReaction(chatId, message.message_id, "👀").catch(() => {});
     const allChats = [chatId];
     resetStreamDraftState();
     startTyping(allChats);
@@ -708,9 +713,10 @@ export function resetTelegramRuntimeForTests() {
   sendQueue = [];
   sendQueueRunning = false;
   bot = null;
+  telegramToken = null;
   bubbleActive = false;
 }
 
 export function setTelegramTokenForTests(token: string) {
-  bot = { _token: token } as unknown as Bot;
+  telegramToken = token;
 }
