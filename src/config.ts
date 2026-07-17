@@ -9,7 +9,7 @@ const EnvSchema = z.object({
   TELEGRAM_BOT_TOKEN: z.string().min(10, "TELEGRAM_BOT_TOKEN is required"),
   GROK_CWD: z.string().default(process.cwd()),
   GROK_BIN: z.string().default("grok"),
-  GROK_MODEL: z.string().default("grok-build"),
+  GROK_MODEL: z.string().default("grok-4.5"),
   STATE_DIR: z.string().default(resolve(process.cwd(), ".grok-telegram-state")),
   GROK_ALWAYS_APPROVE: z
     .string()

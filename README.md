@@ -4,7 +4,7 @@
   <img src="images/logo.webp" alt="Grok Build Telegram logo" width="400">
 </p>
 
-Run an xAI Grok Build coding-agent session from a private Telegram chat. The bridge uses the official [Agent Client Protocol (ACP)](https://agentclientprotocol.com) over `grok agent --model grok-build stdio`; it does not expose an inbound HTTP server or Telegram webhook.
+Run an xAI Grok Build coding-agent session from a private Telegram chat. The bridge uses the official [Agent Client Protocol (ACP)](https://agentclientprotocol.com) over `grok agent --model grok-4.5 stdio`; it does not expose an inbound HTTP server or Telegram webhook.
 
 ## Features
 
@@ -18,7 +18,7 @@ Run an xAI Grok Build coding-agent session from a private Telegram chat. The bri
 ## Requirements
 
 - Node.js 24 or later
-- A locally installed and authenticated Grok CLI with access to the `grok-build` model
+- A locally installed and authenticated Grok CLI with access to the `grok-4.5` model
 - A Telegram bot token from [@BotFather](https://t.me/BotFather)
 
 ## Quick start
@@ -80,7 +80,7 @@ Copy `.env.example` to `.env`. The primary settings are:
 | `TELEGRAM_BOT_TOKEN` | Required | Token issued by @BotFather |
 | `GROK_CWD` | Current directory | Working directory available to Grok |
 | `GROK_BIN` | `grok` | Grok executable path; common user locations are also detected |
-| `GROK_MODEL` | `grok-build` | Model passed to `grok agent` |
+| `GROK_MODEL` | `grok-4.5` | Model passed to `grok agent` |
 | `STATE_DIR` | `./.grok-telegram-state` | Directory for access, lock, and health state |
 | `GROK_ALWAYS_APPROVE` | `false` | Automatically approve ACP permissions; unsafe outside a fully trusted environment |
 
@@ -145,7 +145,7 @@ The code is intentionally printed only in the bridge terminal. Send any message 
 Confirm that `GROK_BIN` points to a working CLI, the CLI is already authenticated, `GROK_CWD` exists, and this command works locally:
 
 ```bash
-grok agent --model grok-build stdio
+grok agent --model grok-4.5 stdio
 ```
 
 **A prompt appears stalled**

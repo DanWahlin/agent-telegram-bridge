@@ -3,7 +3,7 @@ import { Readable, Writable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk";
 
 const grok = process.env["GROK_BIN"] || "/root/.grok/bin/grok";
-const child = spawn(grok, ["agent", "--model", "grok-build", "--always-approve", "stdio"], {
+const child = spawn(grok, ["agent", "--model", "grok-4.5", "--always-approve", "stdio"], {
   cwd: "/tmp",
   stdio: ["pipe", "pipe", "inherit"],
   shell: false,
