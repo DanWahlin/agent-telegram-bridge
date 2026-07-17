@@ -88,20 +88,16 @@ Copy `.env.example` to `.env`. The primary settings are:
 
 ## How it works
 
-```text
-Private Telegram message
-        |
-        v
-Authorization and single-prompt gate
-        |
-        v
-Persistent ACP session over Grok stdio
-        |
-        +--> streamed text --> Telegram draft and final messages
-        |
-        +--> tool updates --> Telegram progress bubble
-        |
-        +--> permission request --> owner-bound approve/reject controls
+```mermaid
+flowchart LR
+    telegram["Private Telegram message"] --> gate{"Authorized owner<br/>and no active prompt?"}
+    gate -- No --> rejected["Reject with guidance"]
+    gate -- Yes --> acp["Persistent Grok ACP session<br/>over stdio"]
+    acp -- Text chunks --> queue["Shared paced Telegram queue"]
+    queue --> response["Draft edits and final messages"]
+    acp -- Tool updates --> bubble["Tool-progress bubble"]
+    acp -- Permission request --> permission["Owner-bound approve/reject controls"]
+    permission -- Decision --> acp
 ```
 
 - `grammY` long-polls Telegram. No webhook endpoint is opened.
