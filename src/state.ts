@@ -420,6 +420,13 @@ export function takePendingPermission(id?: string): PendingPermissionState | nul
   pendingPermission = null;
   return current;
 }
+export function cancelPendingPermissionState(): PendingPermissionState | null {
+  const pending = takePendingPermission();
+  if (!pending) return null;
+  clearTimeout(pending.timer);
+  pending.resolve({ outcome: { outcome: "cancelled" } });
+  return pending;
+}
 export function setPendingPermission(p: PendingPermissionState | null): void {
   pendingPermission = p;
 }

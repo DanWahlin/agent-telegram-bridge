@@ -10,6 +10,7 @@ import {
   getActivePrompt,
   getPendingPermission,
   takePendingPermission,
+  cancelPendingPermissionState,
   clearActivePrompt,
   updateActivePromptActivity,
   getTypingStartedAt,
@@ -284,10 +285,8 @@ export function createBridge(config: Config): Bridge {
   }
 
   function cancelPendingPermission(): Promise<void> | null {
-    const pending = takePendingPermission();
+    const pending = cancelPendingPermissionState();
     if (!pending) return null;
-    clearTimeout(pending.timer);
-    pending.resolve({ outcome: { outcome: "cancelled" } });
     return expirePermissionCards(pending.summary, pending.messages).catch((error: unknown) => {
       console.warn(`[TG] Pending permission card cleanup failed: ${sanitizedError(error)}`);
     });

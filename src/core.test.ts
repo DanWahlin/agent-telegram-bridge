@@ -17,6 +17,9 @@ import {
   lockOwnedByCurrentProcess,
   enqueuePrompt,
   clearPromptQueue,
+  setPendingPermission,
+  getPendingPermission,
+  cancelPendingPermissionState,
   resetRuntimeStateForTests,
   type AccessState,
 } from "./state.js";
@@ -151,6 +154,27 @@ describe("access and locks", () => {
     const access: AccessState = { allowedUsers: ["42"], pending: {} };
     expect(isAllowed(access, 42)).toBe(true);
     expect(isAllowed(access, 43)).toBe(false);
+  });
+
+  it("atomically cancels and clears a pending permission", () => {
+    const resolve = vi.fn();
+    const timer = setTimeout(() => undefined, 60_000);
+    setPendingPermission({
+      id: "permission-1",
+      kind: "tool",
+      summary: "Run command",
+      startedAt: new Date().toISOString(),
+      timer,
+      resolve,
+      messages: [],
+    });
+
+    const cancelled = cancelPendingPermissionState();
+
+    expect(cancelled?.id).toBe("permission-1");
+    expect(getPendingPermission()).toBeNull();
+    expect(resolve).toHaveBeenCalledWith({ outcome: { outcome: "cancelled" } });
+    resetRuntimeStateForTests();
   });
 
   it("recognizes a lock owned by this process", () => {
