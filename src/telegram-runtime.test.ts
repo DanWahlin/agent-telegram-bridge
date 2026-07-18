@@ -5,6 +5,8 @@ import { join } from "node:path";
 import {
   appendAssistantDelta,
   dismissBubble,
+  editMessageReplyMarkup,
+  editPermissionMessage,
   finalizeStreamDrafts,
   getStreamDrafts,
   resetTelegramRuntimeForTests,
@@ -101,6 +103,36 @@ describe("Telegram delivery runtime", () => {
     ]);
     expect(calls[0]?.payload.chat_id).toBe(42);
     expect(calls[0]?.payload.text).toContain("npm test");
+  });
+
+  it("replaces resolved permission cards and removes inline keyboards", async () => {
+    const calls: ApiCall[] = [];
+    const config = createTestConfig(stateDir, { SEND_PACE_MS: 0 });
+    setTelegramRuntimeForTests("test-token", config);
+    stubTelegramApi(calls);
+
+    await editPermissionMessage(42, 7, "✅ Always allowed\n\nEdit src/app.ts\n\nDecision recorded.");
+    await editMessageReplyMarkup(42, 8, null);
+
+    expect(calls).toEqual([
+      {
+        method: "editMessageText",
+        payload: {
+          chat_id: 42,
+          message_id: 7,
+          text: "✅ Always allowed\n\nEdit src/app.ts\n\nDecision recorded.",
+          reply_markup: { inline_keyboard: [] },
+        },
+      },
+      {
+        method: "editMessageReplyMarkup",
+        payload: {
+          chat_id: 42,
+          message_id: 8,
+          reply_markup: { inline_keyboard: [] },
+        },
+      },
+    ]);
   });
 
   it("resets draft state when a later final chunk cannot be delivered", async () => {

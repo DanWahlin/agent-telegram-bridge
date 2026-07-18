@@ -1,5 +1,13 @@
-import { chunkMessage, markdownToTelegramHtml } from "./telegram.js";
+import {
+  chunkMessage,
+  finalizeExistingPermissionText,
+  markdownToTelegramHtml,
+  permissionKeyboard,
+  permissionSelection,
+  resolvedPermissionText,
+} from "./telegram.js";
 import { describe, expect, it } from "vitest";
+import type { PermissionOption } from "@agentclientprotocol/sdk";
 import { sanitizePermissionText } from "./redact.js";
 import { createLockData, isAllowed, lockOwnedByCurrentProcess, type AccessState } from "./state.js";
 import { buildGrokChildEnv } from "./acp-client.js";
@@ -29,6 +37,42 @@ describe("Telegram rendering", () => {
     expect(rendered).not.toContain('href="data:');
     expect(rendered).not.toContain('href="vbscript:');
     expect(rendered).toContain("bad (javascript:alert(1)");
+  });
+});
+
+describe("Telegram permission rendering", () => {
+  const options: PermissionOption[] = [
+    { optionId: "once", name: "Allow once", kind: "allow_once" },
+    { optionId: "always", name: "Always allow", kind: "allow_always" },
+    { optionId: "reject", name: "Reject", kind: "reject_once" },
+  ];
+
+  it("exposes one-time and durable ACP choices instead of collapsing them", () => {
+    expect(permissionKeyboard("request-1", options)).toEqual({
+      inline_keyboard: [
+        [
+          { text: "✅ Allow once", callback_data: "grok:o:request-1:0" },
+          { text: "✅ Always allow", callback_data: "grok:o:request-1:1" },
+        ],
+        [{ text: "❌ Reject once", callback_data: "grok:o:request-1:2" }],
+      ],
+    });
+  });
+
+  it("selects the exact durable option chosen by the owner", () => {
+    expect(permissionSelection(options, 1)).toEqual({
+      decision: { outcome: { outcome: "selected", optionId: "always" } },
+      label: "✅ Always allowed",
+    });
+  });
+
+  it("renders resolved and stale cards as final states", () => {
+    expect(resolvedPermissionText("Edit `src/app.ts`", "✅ Allowed once"))
+      .toBe("✅ Allowed once\n\nEdit `src/app.ts`\n\nDecision recorded.");
+    expect(finalizeExistingPermissionText(
+      "⚠️ Grok Build needs approval\n\nRun tests\n\nTap a button or reply approve/reject.",
+      "⌛ Approval expired",
+    )).toBe("⌛ Approval expired\n\nRun tests\n\nNo action was approved.");
   });
 });
 

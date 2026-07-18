@@ -12,7 +12,7 @@ import type { Config } from "./config.js";
 import { messageSafeRandom, nowIso, sleep } from "./utils.js";
 import { sanitizedError, sanitizePermissionText } from "./redact.js";
 import {
-  getPendingPermission,
+  takePendingPermission,
   setPendingPermission,
   updateActivePromptActivity,
   writeHealthSnapshot,
@@ -221,6 +221,10 @@ export async function handlePermissionForward(
     options: PermissionOption[],
   ) => Promise<Array<{ chatId: number; messageId: number }>>,
   resolve: (outcome: RequestPermissionResponse) => void,
+  expirePermissionCards?: (
+    summary: string,
+    messages: Array<{ chatId: number; messageId: number }>,
+  ) => Promise<void>,
 ): Promise<void> {
   const summary = sanitizePermissionText(
     request.toolCall.title
@@ -231,11 +235,19 @@ export async function handlePermissionForward(
   const messages = await sendPermissionCard(summary, id, request.options);
 
   const timer = setTimeout(() => {
-    const current = getPendingPermission();
-    if (current?.id !== id) return;
-    setPendingPermission(null);
-    writeHealthSnapshot(config, "permission-timeout", { connected: true }, { force: true });
-    resolve({ outcome: { outcome: "cancelled" } });
+    const current = takePendingPermission(id);
+    if (!current) return;
+    void (async () => {
+      if (expirePermissionCards) {
+        try {
+          await expirePermissionCards(current.summary, current.messages);
+        } catch (error: unknown) {
+          console.warn(`[TG] Permission expiry cleanup failed: ${sanitizedError(error)}`);
+        }
+      }
+      writeHealthSnapshot(config, "permission-timeout", { connected: true }, { force: true });
+      current.resolve({ outcome: { outcome: "cancelled" } });
+    })();
   }, config.PERMISSION_TIMEOUT_MS);
   timer.unref();
 

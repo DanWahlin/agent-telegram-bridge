@@ -3,7 +3,12 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createTelegramBot, resetTelegramRuntimeForTests } from "./telegram.js";
-import { saveAccess } from "./state.js";
+import {
+  clearActivePrompt,
+  saveAccess,
+  setPendingPermission,
+  startActivePrompt,
+} from "./state.js";
 import type { Config } from "./config.js";
 import { createTestConfig } from "./test-support.js";
 
@@ -91,6 +96,117 @@ describe("Telegram authorization and prompt dispatch", () => {
       release();
       resetTelegramRuntimeForTests();
     } finally {
+      vi.unstubAllGlobals();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("forwards the exact durable permission option selected from Telegram", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "grok-tg-permission-"));
+    const timer = setTimeout(() => undefined, 60_000);
+    try {
+      const config = makeConfig(dir);
+      saveAccess(config, { allowedUsers: ["42"], pending: {} });
+      startActivePrompt(42, 1, 42);
+      setPendingPermission({
+        id: "request-1",
+        kind: "edit",
+        summary: "Edit src/app.ts",
+        startedAt: new Date().toISOString(),
+        timer,
+        resolve: vi.fn(),
+        messages: [{ chatId: 42, messageId: 10 }],
+        rawRequest: {
+          options: [
+            { optionId: "once", name: "Allow once", kind: "allow_once" },
+            { optionId: "always", name: "Always allow", kind: "allow_always" },
+            { optionId: "reject", name: "Reject", kind: "reject_once" },
+          ],
+        },
+      });
+      const resolvePermission = vi.fn(async () => true);
+      const bot = createTelegramBot(config, { ...makeDeps(config), resolvePermission });
+      (bot as any).botInfo = { id: 999, is_bot: true, first_name: "Test", username: "test_bot", can_join_groups: false, can_read_all_group_messages: false, supports_inline_queries: false };
+      vi.stubGlobal("fetch", vi.fn(async () =>
+        new Response(JSON.stringify({ ok: true, result: true }))));
+
+      await bot.handleUpdate({
+        update_id: 3,
+        callback_query: {
+          id: "callback-1",
+          from: { id: 42, is_bot: false, first_name: "Dan" },
+          chat_instance: "test",
+          data: "grok:o:request-1:1",
+          message: {
+            message_id: 10,
+            date: 0,
+            text: "⚠️ Grok Build needs approval\n\nEdit src/app.ts",
+            chat: { id: 42, type: "private", first_name: "Dan" },
+          },
+        },
+      } as any);
+
+      expect(resolvePermission).toHaveBeenCalledWith(
+        { outcome: { outcome: "selected", optionId: "always" } },
+        "✅ Always allowed",
+        "Dan",
+      );
+    } finally {
+      clearTimeout(timer);
+      setPendingPermission(null);
+      clearActivePrompt();
+      resetTelegramRuntimeForTests();
+      vi.unstubAllGlobals();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("marks stale permission cards expired and removes their keyboard", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "grok-tg-stale-permission-"));
+    try {
+      const config = makeConfig(dir);
+      saveAccess(config, { allowedUsers: ["42"], pending: {} });
+      const calls: Array<{ method: string; payload: Record<string, unknown> }> = [];
+      const bot = createTelegramBot(config, makeDeps(config));
+      (bot as any).botInfo = { id: 999, is_bot: true, first_name: "Test", username: "test_bot", can_join_groups: false, can_read_all_group_messages: false, supports_inline_queries: false };
+      vi.stubGlobal("fetch", vi.fn(async (input: string | URL, init?: RequestInit) => {
+        calls.push({
+          method: String(input).split("/").pop() ?? "",
+          payload: JSON.parse(String(init?.body)) as Record<string, unknown>,
+        });
+        return new Response(JSON.stringify({ ok: true, result: true }));
+      }));
+
+      await bot.handleUpdate({
+        update_id: 4,
+        callback_query: {
+          id: "callback-stale",
+          from: { id: 42, is_bot: false, first_name: "Dan" },
+          chat_instance: "test",
+          data: "grok:a:old-request",
+          message: {
+            message_id: 11,
+            date: 0,
+            text: "⚠️ Grok Build needs approval\n\nRun npm test\n\nTap a button or reply approve/reject.",
+            chat: { id: 42, type: "private", first_name: "Dan" },
+          },
+        },
+      } as any);
+
+      expect(calls[0]).toEqual({
+        method: "editMessageText",
+        payload: {
+          chat_id: 42,
+          message_id: 11,
+          text: "⌛ Approval expired\n\nRun npm test\n\nNo action was approved.",
+          reply_markup: { inline_keyboard: [] },
+        },
+      });
+      expect(calls[1]?.method).toBe("answerCallbackQuery");
+    } finally {
+      clearActivePrompt();
+      setPendingPermission(null);
+      resetTelegramRuntimeForTests();
       vi.unstubAllGlobals();
       rmSync(dir, { recursive: true, force: true });
     }

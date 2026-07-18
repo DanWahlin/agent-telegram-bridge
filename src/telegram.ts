@@ -4,6 +4,7 @@ import type {
   ReactionTypeEmoji,
 } from "grammy/types";
 import type {
+  PermissionOption,
   RequestPermissionResponse,
   ToolCallStatus,
 } from "@agentclientprotocol/sdk";
@@ -81,6 +82,88 @@ interface TelegramApiEnvelope {
   result?: unknown;
   description?: string;
   parameters?: { retry_after?: number };
+}
+
+const PERMISSION_LABELS: Record<PermissionOption["kind"], string> = {
+  allow_once: "✅ Allowed once",
+  allow_always: "✅ Always allowed",
+  reject_once: "❌ Rejected once",
+  reject_always: "⛔ Always rejected",
+};
+
+const PERMISSION_BUTTON_LABELS: Record<PermissionOption["kind"], string> = {
+  allow_once: "✅ Allow once",
+  allow_always: "✅ Always allow",
+  reject_once: "❌ Reject once",
+  reject_always: "⛔ Always reject",
+};
+
+export function permissionKeyboard(
+  id: string,
+  options: PermissionOption[],
+): InlineKeyboardMarkup {
+  const allows: InlineKeyboardMarkup["inline_keyboard"][number] = [];
+  const rejects: InlineKeyboardMarkup["inline_keyboard"][number] = [];
+  options.forEach((option, index) => {
+    const button = {
+      text: PERMISSION_BUTTON_LABELS[option.kind],
+      callback_data: `grok:o:${id}:${index}`,
+    };
+    if (option.kind.startsWith("allow_")) allows.push(button);
+    else rejects.push(button);
+  });
+  if (rejects.length === 0) {
+    rejects.push({ text: "❌ Reject", callback_data: `grok:c:${id}` });
+  }
+  return { inline_keyboard: [allows, rejects].filter((row) => row.length > 0) };
+}
+
+export function permissionSelection(
+  options: PermissionOption[],
+  index: number,
+): { decision: RequestPermissionResponse; label: string } | null {
+  const option = options[index];
+  if (!option) return null;
+  return {
+    decision: { outcome: { outcome: "selected", optionId: option.optionId } },
+    label: PERMISSION_LABELS[option.kind],
+  };
+}
+
+export function permissionSelectionByKind(
+  options: PermissionOption[],
+  kinds: PermissionOption["kind"][],
+): { decision: RequestPermissionResponse; label: string } | null {
+  const option = kinds
+    .map((kind) => options.find((candidate) => candidate.kind === kind))
+    .find((candidate): candidate is PermissionOption => candidate !== undefined);
+  if (!option) return null;
+  return {
+    decision: { outcome: { outcome: "selected", optionId: option.optionId } },
+    label: PERMISSION_LABELS[option.kind],
+  };
+}
+
+export function pendingPermissionText(summary: string): string {
+  return `⚠️ Grok Build needs approval\n\n${summary}\n\nChoose an option below or reply approve/reject.`;
+}
+
+export function resolvedPermissionText(summary: string, label: string): string {
+  return `${label}\n\n${summary}\n\nDecision recorded.`;
+}
+
+export function expiredPermissionText(summary: string): string {
+  return `⌛ Approval expired\n\n${summary}\n\nNo action was approved.`;
+}
+
+export function finalizeExistingPermissionText(text: string | undefined, label: string): string {
+  const summary = String(text || "Permission request")
+    .replace(/^⚠️ Grok Build needs approval\s*/u, "")
+    .replace(/\s*(?:Tap a button|Choose an option below).*$/su, "")
+    .trim() || "Permission request";
+  return label === "⌛ Approval expired"
+    ? expiredPermissionText(summary)
+    : resolvedPermissionText(summary, label);
 }
 
 class TelegramApiError extends Error {
@@ -341,7 +424,20 @@ export async function editMessageReplyMarkup(
   await enqueue(() => callApi("editMessageReplyMarkup", {
     chat_id: chatId,
     message_id: messageId,
-    reply_markup: replyMarkup,
+    reply_markup: replyMarkup ?? { inline_keyboard: [] },
+  }, getTelegramToken()));
+}
+
+export async function editPermissionMessage(
+  chatId: number,
+  messageId: number,
+  text: string,
+): Promise<void> {
+  await enqueue(() => callApi("editMessageText", {
+    chat_id: chatId,
+    message_id: messageId,
+    text,
+    reply_markup: { inline_keyboard: [] },
   }, getTelegramToken()));
 }
 
@@ -713,6 +809,7 @@ export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
       "",
       "Send any message to prompt Grok Build.",
       "While working, send /cancel to stop, /status for health, /new for fresh session.",
+      "Permission cards show once/always/reject choices when ACP offers them and update after selection.",
       "",
       "Pairing: first message from unknown user generates a code shown in the terminal.",
     ].join("\n");
@@ -769,46 +866,71 @@ export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
       await answerCallbackQuery(ctx.callbackQuery.id, "Not authorized", true);
       return;
     }
-    const [, action, id] = data.split(":", 3);
+    const [, action, id, optionIndex] = data.split(":", 4);
     const pp = getPendingPermission();
     const active = getActivePrompt();
+    const callbackMessage = ctx.callbackQuery.message;
+    const expireCallbackCard = async (): Promise<void> => {
+      if (!ctx.chat || !callbackMessage) return;
+      const existingText = "text" in callbackMessage ? callbackMessage.text : undefined;
+      try {
+        await editPermissionMessage(
+          ctx.chat.id,
+          callbackMessage.message_id,
+          finalizeExistingPermissionText(existingText, "⌛ Approval expired"),
+        );
+      } catch (error: unknown) {
+        console.warn(`[TG] Failed to expire stale permission card: ${sanitizedError(error)}`);
+        try {
+          await editMessageReplyMarkup(ctx.chat.id, callbackMessage.message_id, null);
+        } catch (fallbackError: unknown) {
+          console.warn(`[TG] Failed to clear stale permission buttons: ${sanitizedError(fallbackError)}`);
+        }
+      }
+    };
     if (!pp || pp.id !== id || !active || active.userId !== ctx.from.id || active.chatId !== ctx.chat?.id) {
+      await expireCallbackCard();
       await answerCallbackQuery(
         ctx.callbackQuery.id,
         "This approval has expired or belongs to another session.",
       );
       return;
     }
-    let decision: RequestPermissionResponse;
-    let label = "";
-    if (action === "a") {
-      label = "✅ Approved";
-      const opts = pp.rawRequest?.options ?? [];
-      const chosen = opts.find((option) => option.kind === "allow_once")
-        ?? opts.find((option) => option.kind === "allow_always");
-      decision = chosen
-        ? { outcome: { outcome: "selected", optionId: chosen.optionId } }
-        : { outcome: { outcome: "cancelled" } };
+
+    const options = pp.rawRequest?.options ?? [];
+    let selection: { decision: RequestPermissionResponse; label: string } | null = null;
+    if (action === "o") {
+      const index = Number(optionIndex);
+      if (Number.isInteger(index) && index >= 0) selection = permissionSelection(options, index);
+    } else if (action === "c") {
+      selection = {
+        decision: { outcome: { outcome: "cancelled" } },
+        label: "❌ Rejected",
+      };
+    } else if (action === "a") {
+      selection = permissionSelectionByKind(options, ["allow_once", "allow_always"]);
     } else if (action === "r") {
-      label = "❌ Rejected";
-      decision = { outcome: { outcome: "cancelled" } };
+      selection = permissionSelectionByKind(options, ["reject_once", "reject_always"])
+        ?? { decision: { outcome: { outcome: "cancelled" } }, label: "❌ Rejected" };
     } else {
       await answerCallbackQuery(ctx.callbackQuery.id, "Unknown action");
       return;
     }
-    await answerCallbackQuery(ctx.callbackQuery.id, label);
+    if (!selection) {
+      await answerCallbackQuery(ctx.callbackQuery.id, "That option is no longer available.", true);
+      return;
+    }
+
     const userDisplay = ctx.from?.first_name || ctx.from?.username || "Telegram";
-    if (deps.resolvePermission) {
-      await deps.resolvePermission(decision, label, userDisplay);
+    const resolved = deps.resolvePermission
+      ? await deps.resolvePermission(selection.decision, selection.label, userDisplay)
+      : false;
+    if (!resolved) {
+      await expireCallbackCard();
+      await answerCallbackQuery(ctx.callbackQuery.id, "This approval has already been handled.");
+      return;
     }
-    const callbackMessage = ctx.callbackQuery.message;
-    if (ctx.chat && callbackMessage) {
-      try {
-        await editMessageReplyMarkup(ctx.chat.id, callbackMessage.message_id, null);
-      } catch (error: unknown) {
-        console.warn(`[TG] Failed to clear permission buttons: ${sanitizedError(error)}`);
-      }
-    }
+    await answerCallbackQuery(ctx.callbackQuery.id, selection.label);
   });
 
   bot.on("message", async (ctx) => {
@@ -830,18 +952,39 @@ export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
     if (pp && isAllowed(access, userId)) {
       const active = getActivePrompt();
       const norm = text.trim().toLowerCase();
-      if (active?.userId === userId && active.chatId === chatId && (/^(approve|yes|y|ok)$/.test(norm) || /^(reject|no|n|deny)$/.test(norm))) {
-        const approve = /^(approve|yes|y|ok)$/.test(norm);
-        const label = approve ? "✅ Approved" : "❌ Rejected";
-        const opts = pp.rawRequest?.options ?? [];
-        const chosen = opts.find((option) => option.kind === "allow_once")
-          ?? opts.find((option) => option.kind === "allow_always");
-        const decision: RequestPermissionResponse = approve && chosen
-          ? { outcome: { outcome: "selected", optionId: chosen.optionId } }
-          : { outcome: { outcome: "cancelled" } };
-        if (deps.resolvePermission) await deps.resolvePermission(decision, label, ctx.from?.first_name || "Telegram");
+      const allowOnce = /^(approve|yes|y|ok)$/.test(norm);
+      const allowAlways = /^(always|always approve|approve always)$/.test(norm);
+      const rejectOnce = /^(reject|no|n|deny)$/.test(norm);
+      const rejectAlways = /^(always reject|reject always|always deny|deny always)$/.test(norm);
+      if (active?.userId === userId && active.chatId === chatId && (allowOnce || allowAlways || rejectOnce || rejectAlways)) {
+        const options = pp.rawRequest?.options ?? [];
+        let selection: { decision: RequestPermissionResponse; label: string } | null;
+        if (allowAlways) {
+          selection = permissionSelectionByKind(options, ["allow_always"]);
+        } else if (allowOnce) {
+          selection = permissionSelectionByKind(options, ["allow_once", "allow_always"]);
+        } else if (rejectAlways) {
+          selection = permissionSelectionByKind(options, ["reject_always"]);
+        } else {
+          selection = permissionSelectionByKind(options, ["reject_once", "reject_always"])
+            ?? { decision: { outcome: { outcome: "cancelled" } }, label: "❌ Rejected" };
+        }
+        if (!selection) {
+          await sendMessage(chatId, "That permission option isn't available for this request.");
+          return;
+        }
+        const resolved = deps.resolvePermission
+          ? await deps.resolvePermission(selection.decision, selection.label, ctx.from?.first_name || "Telegram")
+          : false;
+        if (!resolved) {
+          await sendMessage(chatId, "That approval has already been handled or expired.");
+          return;
+        }
         try {
-          if (ctx.message?.message_id) await setMessageReaction(chatId, ctx.message.message_id, "👀");
+          if (ctx.message?.message_id) {
+            const reaction: ReactionTypeEmoji["emoji"] = selection.label.startsWith("✅") ? "👍" : "👎";
+            await setMessageReaction(chatId, ctx.message.message_id, reaction);
+          }
         } catch (error: unknown) {
           console.warn(`[TG] Failed to acknowledge permission reply: ${sanitizedError(error)}`);
         }

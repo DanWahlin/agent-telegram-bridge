@@ -378,6 +378,12 @@ export function setActivePrompt(p: ActivePromptState | null): void {
 export function getPendingPermission(): PendingPermissionState | null {
   return pendingPermission;
 }
+export function takePendingPermission(id?: string): PendingPermissionState | null {
+  if (!pendingPermission || (id !== undefined && pendingPermission.id !== id)) return null;
+  const current = pendingPermission;
+  pendingPermission = null;
+  return current;
+}
 export function setPendingPermission(p: PendingPermissionState | null): void {
   pendingPermission = p;
 }

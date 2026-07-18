@@ -9,7 +9,7 @@ import {
   writeHealthSnapshot,
   getActivePrompt,
   getPendingPermission,
-  setPendingPermission,
+  takePendingPermission,
   clearActivePrompt,
   updateActivePromptActivity,
   getTypingStartedAt,
@@ -20,7 +20,12 @@ import {
   createTelegramBot,
   stopPolling,
   sendMessage,
+  editPermissionMessage,
   editMessageReplyMarkup,
+  expiredPermissionText,
+  pendingPermissionText,
+  permissionKeyboard,
+  resolvedPermissionText,
   resetStreamDraftState,
   finalizeStreamDrafts,
   stopTyping,
@@ -45,7 +50,7 @@ import type {
 } from "@agentclientprotocol/sdk";
 import { nowIso, formatAge, ageMs } from "./utils.js";
 import { sanitizedError, sanitizePermissionText } from "./redact.js";
-import { Bot, InlineKeyboard } from "grammy";
+import { Bot } from "grammy";
 
 export interface Bridge {
   start: () => Promise<void>;
@@ -113,11 +118,10 @@ export function createBridge(config: Config): Bridge {
   ): Promise<Array<{ chatId: number; messageId: number }>> {
     const active = getActivePrompt();
     const chats = active ? [active.chatId] : [];
-    const keyboard = new InlineKeyboard()
-      .text("✅ Approve", `grok:a:${id}`)
-      .text("❌ Reject", `grok:r:${id}`);
+    const keyboard = permissionKeyboard(id, _options);
     const msgs: Array<{ chatId: number; messageId: number }> = [];
-    const text = `⚠️ Grok Build needs approval\n\n${sanitizePermissionText(summary, config.PERMISSION_SUMMARY_MAX)}\n\nTap a button or reply approve/reject.`;
+    const safeSummary = sanitizePermissionText(summary, config.PERMISSION_SUMMARY_MAX);
+    const text = pendingPermissionText(safeSummary);
     if (chats.length === 0) {
       throw new Error("No active Telegram chat available for ACP permission request");
     }
@@ -140,23 +144,53 @@ export function createBridge(config: Config): Bridge {
     label: string,
     _userDisplay: string,
   ): Promise<boolean> {
-    const pp = getPendingPermission();
+    const pp = takePendingPermission();
     if (!pp) return false;
     clearTimeout(pp.timer);
     const messages = [...pp.messages];
-    setPendingPermission(null);
     for (const m of messages) {
       try {
-        await editMessageReplyMarkup(m.chatId, m.messageId, null);
-        await sendMessage(m.chatId, `${label} (via Telegram)`);
+        await editPermissionMessage(
+          m.chatId,
+          m.messageId,
+          resolvedPermissionText(pp.summary, label),
+        );
       } catch (error: unknown) {
         console.warn(`[TG] Permission confirmation cleanup failed: ${sanitizedError(error)}`);
+        try {
+          await editMessageReplyMarkup(m.chatId, m.messageId, null);
+          await sendMessage(m.chatId, `${label} (via Telegram)`);
+        } catch (fallbackError: unknown) {
+          console.warn(`[TG] Permission confirmation fallback failed: ${sanitizedError(fallbackError)}`);
+        }
       }
     }
     // call the ACP resolver
     pp.resolve(decision);
     writeHealthSnapshot(config, "permission-resolved", buildExtra(), { force: true });
     return true;
+  }
+
+  async function expirePermissionCards(
+    summary: string,
+    messages: Array<{ chatId: number; messageId: number }>,
+  ): Promise<void> {
+    for (const message of messages) {
+      try {
+        await editPermissionMessage(
+          message.chatId,
+          message.messageId,
+          expiredPermissionText(summary),
+        );
+      } catch (error: unknown) {
+        console.warn(`[TG] Failed to expire permission card: ${sanitizedError(error)}`);
+        try {
+          await editMessageReplyMarkup(message.chatId, message.messageId, null);
+        } catch (fallbackError: unknown) {
+          console.warn(`[TG] Failed to clear expired permission buttons: ${sanitizedError(fallbackError)}`);
+        }
+      }
+    }
   }
 
   // ACP handlers
@@ -188,13 +222,18 @@ export function createBridge(config: Config): Bridge {
     },
     onPermissionRequest: async (req: PermissionRequest) => {
       if (config.GROK_ALWAYS_APPROVE) {
-        const allow = (req.options || []).find((option) =>
-          option.kind === "allow_once" || option.kind === "allow_always"
-        );
+        const allow = (req.options || []).find((option) => option.kind === "allow_always")
+          ?? (req.options || []).find((option) => option.kind === "allow_once");
         return { outcome: allow ? { outcome: "selected", optionId: allow.optionId } : { outcome: "cancelled" } };
       }
       return new Promise((resolve) => {
-        handlePermissionForward(config, req, sendPermissionCard, resolve).catch((error: unknown) => {
+        handlePermissionForward(
+          config,
+          req,
+          sendPermissionCard,
+          resolve,
+          expirePermissionCards,
+        ).catch((error: unknown) => {
           console.error(`[ACP] Permission forwarding failed: ${sanitizedError(error)}`);
           resolve({ outcome: { outcome: "cancelled" } });
         });
@@ -401,17 +440,11 @@ export function createBridge(config: Config): Bridge {
     resetStreamDraftState();
     await dismissBubble();
 
-    const pp = getPendingPermission();
+    const pp = takePendingPermission();
     if (pp) {
       clearTimeout(pp.timer);
-      setPendingPermission(null);
-      for (const m of pp.messages) {
-        try {
-          await editMessageReplyMarkup(m.chatId, m.messageId, null);
-        } catch (error: unknown) {
-          console.warn(`[TG] Failed to clear pending permission during shutdown: ${sanitizedError(error)}`);
-        }
-      }
+      await expirePermissionCards(pp.summary, pp.messages);
+      pp.resolve({ outcome: { outcome: "cancelled" } });
     }
 
     clearActivePrompt();
