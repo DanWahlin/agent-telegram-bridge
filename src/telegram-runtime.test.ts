@@ -111,7 +111,7 @@ describe("Telegram delivery runtime", () => {
     setTelegramRuntimeForTests("test-token", config);
     stubTelegramApi(calls);
 
-    await editPermissionMessage(42, 7, "✅ Always allowed\n\nEdit src/app.ts\n\nDecision recorded.");
+    await editPermissionMessage(42, 7, "✅ Allowed for session\n\nEdit src/app.ts\n\nDecision recorded.");
     await editMessageReplyMarkup(42, 8, null);
 
     expect(calls).toEqual([
@@ -120,7 +120,7 @@ describe("Telegram delivery runtime", () => {
         payload: {
           chat_id: 42,
           message_id: 7,
-          text: "✅ Always allowed\n\nEdit src/app.ts\n\nDecision recorded.",
+          text: "✅ Allowed for session\n\nEdit src/app.ts\n\nDecision recorded.",
           reply_markup: { inline_keyboard: [] },
         },
       },

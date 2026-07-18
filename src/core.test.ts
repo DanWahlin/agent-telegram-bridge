@@ -52,7 +52,7 @@ describe("Telegram permission rendering", () => {
       inline_keyboard: [
         [
           { text: "✅ Allow once", callback_data: "grok:o:request-1:0" },
-          { text: "✅ Always allow", callback_data: "grok:o:request-1:1" },
+          { text: "✅ Allow for session", callback_data: "grok:o:request-1:1" },
         ],
         [{ text: "❌ Reject once", callback_data: "grok:o:request-1:2" }],
       ],
@@ -62,7 +62,7 @@ describe("Telegram permission rendering", () => {
   it("selects the exact durable option chosen by the owner", () => {
     expect(permissionSelection(options, 1)).toEqual({
       decision: { outcome: { outcome: "selected", optionId: "always" } },
-      label: "✅ Always allowed",
+      label: "✅ Allowed for session",
     });
   });
 

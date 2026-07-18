@@ -9,7 +9,7 @@ Run an xAI Grok Build coding-agent session from a private Telegram chat. The bri
 ## Features
 
 - **Secure by default**: private chats only, one numeric Telegram owner, expiring attempt-limited pairing codes, and atomic owner-only state files.
-- **Interactive permissions**: choose **Allow once**, **Always allow**, or the reject options offered by ACP. Resolved cards are replaced with their final status, and expired cards lose their buttons. Permissions are never approved automatically unless `GROK_ALWAYS_APPROVE=true`.
+- **Interactive permissions**: choose **Allow once**, **Allow for session**, or the reject options offered by ACP. Resolved cards are replaced with their final status, and expired cards lose their buttons. Permissions are never approved automatically unless `GROK_ALWAYS_APPROVE=true`.
 - **Streaming responses**: throttled draft edits, ordered multi-message final responses, typing indicators, tool-progress bubbles, progress notices, and stall detection.
 - **Single-poller protection**: a PID, hostname, process-start token, and heartbeat lock prevent competing bridge instances.
 - **Operational visibility**: `/status` and `health.json` report session, prompt, permission, polling, and tool activity.
@@ -96,7 +96,7 @@ flowchart LR
     acp -- Text chunks --> queue["Shared paced Telegram queue"]
     queue --> response["Draft edits and final messages"]
     acp -- Tool updates --> bubble["Tool-progress bubble"]
-    acp -- Permission request --> permission["Owner-bound once/always/reject controls"]
+    acp -- Permission request --> permission["Owner-bound once/session/reject controls"]
     permission -- Decision --> acp
 ```
 
@@ -104,7 +104,7 @@ flowchart LR
 - Prompts are serialized. A second prompt is rejected while one is active.
 - Assistant output is HTML-escaped, rendered from a limited Markdown subset, and split at Telegram's message limit.
 - Tool and permission controls are sent only to the authorized chat that owns the active prompt.
-- Permission cards expose ACP's actual options. Selecting a choice replaces the card with **Allowed once**, **Always allowed**, **Rejected**, or **Expired**, so old buttons cannot be mistaken for pending requests.
+- Permission cards expose ACP's actual options. Selecting a choice replaces the card with **Allowed once**, **Allowed for session**, **Rejected**, or **Expired**, so old buttons cannot be mistaken for pending requests.
 - Outbound Telegram operations share one paced queue with retry handling for rate limits.
 
 ## Runtime state

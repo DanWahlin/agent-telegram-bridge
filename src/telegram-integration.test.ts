@@ -148,7 +148,7 @@ describe("Telegram authorization and prompt dispatch", () => {
 
       expect(resolvePermission).toHaveBeenCalledWith(
         { outcome: { outcome: "selected", optionId: "always" } },
-        "✅ Always allowed",
+        "✅ Allowed for session",
         "Dan",
       );
     } finally {

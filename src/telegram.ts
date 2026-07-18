@@ -86,14 +86,14 @@ interface TelegramApiEnvelope {
 
 const PERMISSION_LABELS: Record<PermissionOption["kind"], string> = {
   allow_once: "✅ Allowed once",
-  allow_always: "✅ Always allowed",
+  allow_always: "✅ Allowed for session",
   reject_once: "❌ Rejected once",
   reject_always: "⛔ Always rejected",
 };
 
 const PERMISSION_BUTTON_LABELS: Record<PermissionOption["kind"], string> = {
   allow_once: "✅ Allow once",
-  allow_always: "✅ Always allow",
+  allow_always: "✅ Allow for session",
   reject_once: "❌ Reject once",
   reject_always: "⛔ Always reject",
 };
@@ -809,7 +809,7 @@ export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
       "",
       "Send any message to prompt Grok Build.",
       "While working, send /cancel to stop, /status for health, /new for fresh session.",
-      "Permission cards show once/always/reject choices when ACP offers them and update after selection.",
+      "Permission cards show once/session/reject choices when ACP offers them and update after selection.",
       "",
       "Pairing: first message from unknown user generates a code shown in the terminal.",
     ].join("\n");
