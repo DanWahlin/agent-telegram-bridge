@@ -7,7 +7,7 @@ import {
   rmSync,
   renameSync,
 } from "node:fs";
-import { join } from "node:path";
+import { join, resolve as resolvePath } from "node:path";
 import { hostname, platform } from "node:os";
 import { z, type ZodType } from "zod";
 import type { PermissionOption, RequestPermissionResponse } from "@agentclientprotocol/sdk";
@@ -69,6 +69,11 @@ export interface HealthSnapshot {
     messageCount: number;
   } | null;
   acpSessionId: string | null;
+  queueDepth: number;
+  cwd: string | null;
+  verbose: boolean;
+  modeId: string | null;
+  usage: { used: number; size: number; costAmount?: number; currency?: string } | null;
   likelyState: string;
 }
 
@@ -352,6 +357,29 @@ export interface ActivePromptState {
   warningSent: boolean;
   progressNoticeCount: number;
   lastProgressNoticeAt: string | null;
+  toolCount: number;
+  cancelling: boolean;
+  staleMessageId: number | null;
+  inboxFiles: string[];
+}
+
+export interface QueuedPromptState {
+  id: string;
+  chatId: number;
+  userId: number;
+  messageId: number;
+  text: string;
+  replyContext: string | null;
+  /** Serialized inbox file metadata after download */
+  inboxFiles: Array<{ path: string; mime: string; originalName: string; size: number }>;
+  enqueuedAt: string;
+}
+
+export interface LastFinalResponse {
+  chatId: number;
+  text: string;
+  artifactPaths: string[];
+  savedAt: number;
 }
 
 export interface PendingPermissionState {
@@ -368,6 +396,14 @@ export interface PendingPermissionState {
 let activePrompt: ActivePromptState | null = null;
 let pendingPermission: PendingPermissionState | null = null;
 let typingStartedAt: number | null = null;
+let promptQueue: QueuedPromptState[] = [];
+let lastFinalResponse: LastFinalResponse | null = null;
+let verboseMode = false;
+let currentModeId: string | null = null;
+let lastUsage: { used: number; size: number; costAmount?: number; currency?: string } | null = null;
+let sessionCwd: string | null = null;
+const planMessageIds = new Map<number, number>();
+const thoughtDrafts = new Map<number, { messageId: number | null; text: string; lastEditAt: number }>();
 
 export function getActivePrompt(): ActivePromptState | null {
   return activePrompt;
@@ -394,7 +430,12 @@ export function setTypingStartedAt(t: number | null): void {
   typingStartedAt = t;
 }
 
-export function startActivePrompt(chatId: number, messageId: number, userId = chatId): ActivePromptState {
+export function startActivePrompt(
+  chatId: number,
+  messageId: number,
+  userId = chatId,
+  inboxFiles: string[] = [],
+): ActivePromptState {
   const startedAt = nowIso();
   activePrompt = {
     id: messageSafeRandom(),
@@ -406,12 +447,147 @@ export function startActivePrompt(chatId: number, messageId: number, userId = ch
     warningSent: false,
     progressNoticeCount: 0,
     lastProgressNoticeAt: null,
+    toolCount: 0,
+    cancelling: false,
+    staleMessageId: null,
+    inboxFiles,
   };
   return activePrompt;
 }
 
 export function clearActivePrompt(): void {
   activePrompt = null;
+}
+
+export function markActivePromptCancelling(): void {
+  if (activePrompt) activePrompt.cancelling = true;
+}
+
+export function incrementActivePromptTools(): void {
+  if (activePrompt) activePrompt.toolCount += 1;
+}
+
+// --- Prompt queue ---
+
+export function getPromptQueue(): QueuedPromptState[] {
+  return promptQueue;
+}
+
+export function enqueuePrompt(
+  item: Omit<QueuedPromptState, "id" | "enqueuedAt">,
+  max: number,
+): { ok: true; position: number } | { ok: false; reason: "full" } {
+  if (promptQueue.length >= max) return { ok: false, reason: "full" };
+  promptQueue.push({
+    ...item,
+    id: messageSafeRandom(),
+    enqueuedAt: nowIso(),
+  });
+  return { ok: true, position: promptQueue.length };
+}
+
+export function dequeuePrompt(): QueuedPromptState | null {
+  return promptQueue.shift() ?? null;
+}
+
+export function clearPromptQueue(): QueuedPromptState[] {
+  const cleared = promptQueue;
+  promptQueue = [];
+  return cleared;
+}
+
+export function promptQueueLength(): number {
+  return promptQueue.length;
+}
+
+// --- Last final response (for /retry last) ---
+
+export function setLastFinalResponse(response: LastFinalResponse | null): void {
+  lastFinalResponse = response;
+}
+
+export function getLastFinalResponse(ttlMs: number): LastFinalResponse | null {
+  if (!lastFinalResponse) return null;
+  if (Date.now() - lastFinalResponse.savedAt > ttlMs) {
+    lastFinalResponse = null;
+    return null;
+  }
+  return lastFinalResponse;
+}
+
+// --- Verbose / mode / usage / cwd ---
+
+export function getVerboseMode(): boolean {
+  return verboseMode;
+}
+export function setVerboseMode(value: boolean): void {
+  verboseMode = value;
+}
+
+export function getCurrentModeId(): string | null {
+  return currentModeId;
+}
+export function setCurrentModeId(mode: string | null): void {
+  currentModeId = mode;
+}
+
+export function getLastUsage(): typeof lastUsage {
+  return lastUsage;
+}
+export function setLastUsage(
+  usage: { used: number; size: number; costAmount?: number; currency?: string } | null,
+): void {
+  lastUsage = usage;
+}
+
+export function getSessionCwd(fallback: string): string {
+  return sessionCwd ?? fallback;
+}
+export function setSessionCwd(cwd: string): void {
+  sessionCwd = resolvePath(cwd);
+}
+
+export function getPlanMessageId(chatId: number): number | null {
+  return planMessageIds.get(chatId) ?? null;
+}
+export function setPlanMessageId(chatId: number, messageId: number | null): void {
+  if (messageId == null) planMessageIds.delete(chatId);
+  else planMessageIds.set(chatId, messageId);
+}
+
+export function getThoughtDraft(chatId: number) {
+  return thoughtDrafts.get(chatId) ?? null;
+}
+export function setThoughtDraft(
+  chatId: number,
+  draft: { messageId: number | null; text: string; lastEditAt: number } | null,
+): void {
+  if (!draft) thoughtDrafts.delete(chatId);
+  else thoughtDrafts.set(chatId, draft);
+}
+
+export function resetSessionUiState(): void {
+  planMessageIds.clear();
+  thoughtDrafts.clear();
+  currentModeId = null;
+  lastUsage = null;
+}
+
+/** Test helper to reset module-level runtime state. */
+export function resetRuntimeStateForTests(): void {
+  activePrompt = null;
+  pendingPermission = null;
+  typingStartedAt = null;
+  promptQueue = [];
+  lastFinalResponse = null;
+  verboseMode = false;
+  currentModeId = null;
+  lastUsage = null;
+  sessionCwd = null;
+  planMessageIds.clear();
+  thoughtDrafts.clear();
+  healthInputByStateDir.clear();
+  lastHealthWriteAt = 0;
 }
 
 export interface HealthSnapshotInput {
@@ -513,6 +689,11 @@ export function buildHealthSnapshot(
         }
       : null,
     acpSessionId: resolved.acpSessionId,
+    queueDepth: promptQueue.length,
+    cwd: sessionCwd,
+    verbose: verboseMode,
+    modeId: currentModeId,
+    usage: lastUsage,
     likelyState: getLikelyState(resolved.connected, !!pp, !!(promptActivityAge != null && promptActivityAge > config.PROMPT_STALE_AFTER_MS), !!ap),
   };
   return snapshot;

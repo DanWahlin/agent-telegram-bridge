@@ -1,6 +1,7 @@
-import { Bot } from "grammy";
+import { Bot, type Context } from "grammy";
 import type {
   InlineKeyboardMarkup,
+  Message,
   ReactionTypeEmoji,
 } from "grammy/types";
 import type {
@@ -26,16 +27,50 @@ import {
   getPendingPermission,
   getTypingStartedAt,
   setTypingStartedAt,
+  enqueuePrompt,
+  getSessionCwd,
   type HealthSnapshotInput,
 } from "./state.js";
 import { sanitizedError } from "./redact.js";
+import {
+  downloadTelegramFileBytes,
+  guessMime,
+  isAllowedMime,
+  writeInboxFile,
+  cleanupInboxFiles,
+  readSafeArtifactFile,
+  type InboxFile,
+} from "./media.js";
+import { basename } from "node:path";
+
+
+export interface PromptPayload {
+  text: string;
+  replyContext: string | null;
+  inboxFiles: InboxFile[];
+}
+
+export interface CancelResult {
+  cancelled: boolean;
+  queueCleared: number;
+}
 
 export interface TelegramDeps {
   config: Config;
-  onPrompt: (chatId: number, text: string, fromUserId: number) => Promise<void>;
-  onCancel: (chatId: number, userId: number) => Promise<boolean>;
+  canAcceptPrompts?: () => boolean;
+  onPrompt: (chatId: number, payload: PromptPayload, fromUserId: number) => Promise<void>;
+  onCancel: (chatId: number, userId: number, clearQueue: boolean) => Promise<CancelResult>;
   onNewSession: (chatId: number, userId: number) => Promise<boolean>;
   onStatus: (chatId: number) => Promise<void>;
+  onRetryLast: (chatId: number) => Promise<void>;
+  onSetVerbose: (chatId: number, enabled: boolean) => Promise<void>;
+  onSetCwd: (chatId: number, target: string | null) => Promise<void>;
+  onStaleAction: (
+    chatId: number,
+    userId: number,
+    promptId: string,
+    action: "cancel" | "keep",
+  ) => Promise<boolean>;
   resolvePermission?: (
     decision: RequestPermissionResponse,
     label: string,
@@ -56,7 +91,14 @@ let sendQueueRunning = false;
 let typingInterval: NodeJS.Timeout | null = null;
 let typingDebounceTimer: NodeJS.Timeout | null = null;
 let typingMaxTimer: NodeJS.Timeout | null = null;
-const streamDrafts = new Map<number, { messageId: number | null; text: string; lastSentText: string; lastEditAt: number; timer: NodeJS.Timeout | null; flushing: boolean }>();
+const streamDrafts = new Map<number, {
+  messageId: number | null;
+  text: string;
+  lastSentText: string;
+  lastEditAt: number;
+  timer: NodeJS.Timeout | null;
+  flushing: boolean;
+}>();
 let currentAssistantText = "";
 let bubbleActive = false;
 const bubbleMessageIds = new Map<number, number>();
@@ -66,8 +108,7 @@ let flushInProgress = false;
 let reflushNeeded = false;
 let lastCompletedToolDesc: string | null = null;
 const activeTools = new Map<string, { name: string; description: string }>();
-
-const BUBBLE_DEBOUNCE_MS = 300;
+let toolsSeenCount = 0;
 
 interface TelegramMessageResult {
   message_id: number;
@@ -116,6 +157,15 @@ export function permissionKeyboard(
     rejects.push({ text: "❌ Reject", callback_data: `grok:c:${id}` });
   }
   return { inline_keyboard: [allows, rejects].filter((row) => row.length > 0) };
+}
+
+export function stalePromptKeyboard(promptId: string): InlineKeyboardMarkup {
+  return {
+    inline_keyboard: [[
+      { text: "Cancel", callback_data: `grok:s:${promptId}:cancel` },
+      { text: "Keep waiting", callback_data: `grok:s:${promptId}:keep` },
+    ]],
+  };
 }
 
 export function permissionSelection(
@@ -190,13 +240,11 @@ export function markdownToTelegramHtml(md: string): string {
   }
   let t = md;
 
-  // fenced code
   t = t.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
     code = code.replace(/\n$/, "");
     const cls = lang ? ` class="language-${lang}"` : "";
     return hold(`<pre><code${cls}>${escapeHtml(code)}</code></pre>`);
   });
-  // inline code
   t = t.replace(/`([^`\n]+)`/g, (_, code) => hold(`<code>${escapeHtml(code)}</code>`));
   const renderLink = (text: string, url: string, image: boolean): string => {
     const label = image ? `[${text || "image"}]` : text;
@@ -398,8 +446,8 @@ export async function editFormattedMessage(
       callApi(
         "editMessageText",
         { chat_id: chatId, message_id: messageId, text: html, parse_mode: "HTML" },
-        getTelegramToken()
-      )
+        getTelegramToken(),
+      ),
     );
   } catch (err: unknown) {
     if (err instanceof Error && /can.t parse|entit/i.test(err.message)) {
@@ -407,8 +455,8 @@ export async function editFormattedMessage(
         callApi(
           "editMessageText",
           { chat_id: chatId, message_id: messageId, text: markdown },
-          getTelegramToken()
-        )
+          getTelegramToken(),
+        ),
       );
       return;
     }
@@ -450,8 +498,8 @@ export async function answerCallbackQuery(
     callApi(
       "answerCallbackQuery",
       { callback_query_id: id, text: text || "", show_alert: showAlert },
-      getTelegramToken()
-    )
+      getTelegramToken(),
+    ),
   );
 }
 
@@ -464,20 +512,90 @@ export async function setMessageReaction(
     callApi(
       "setMessageReaction",
       { chat_id: chatId, message_id: messageId, reaction: [{ type: "emoji", emoji }] },
-      getTelegramToken()
-    )
+      getTelegramToken(),
+    ),
   );
 }
 
 export async function sendChatAction(chatId: number, action = "typing"): Promise<void> {
   await enqueue(() =>
-    callApi("sendChatAction", { chat_id: chatId, action }, getTelegramToken())
+    callApi("sendChatAction", { chat_id: chatId, action }, getTelegramToken()),
   );
 }
 
 export async function deleteMessage(chatId: number, messageId: number): Promise<void> {
   await enqueue(() =>
     callApi("deleteMessage", { chat_id: chatId, message_id: messageId }, getTelegramToken()));
+}
+
+export async function sendPhoto(chatId: number, filePath: string, caption?: string): Promise<TelegramMessageResult> {
+  const token = getTelegramToken();
+  const timeoutMs = getRuntimeConfig().API_TIMEOUT_MS;
+  const result = await enqueue(async () => {
+    const form = new FormData();
+    form.append("chat_id", String(chatId));
+    if (caption) form.append("caption", caption.slice(0, 1024));
+    const artifact = readSafeArtifactFile(
+      filePath,
+      getSessionCwd(getRuntimeConfig().grokCwdAbs),
+      getRuntimeConfig().MEDIA_MAX_BYTES,
+    );
+    form.append("photo", new Blob([artifact.bytes]), artifact.name);
+    const res = await fetch(`https://api.telegram.org/bot${token}/sendPhoto`, {
+      method: "POST",
+      body: form,
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!res.ok) {
+      throw new TelegramApiError(`Telegram API sendPhoto failed: ${res.status}`, res.status);
+    }
+    const json = parseApiEnvelope(await res.json());
+    if (!json.ok) {
+      throw new TelegramApiError(
+        `Telegram API sendPhoto returned ok=false: ${sanitizedError(json.description ?? "unknown")}`,
+        0,
+      );
+    }
+    return json.result;
+  });
+  return requireMessageResult(result);
+}
+
+export async function sendDocument(
+  chatId: number,
+  filePath: string,
+  caption?: string,
+): Promise<TelegramMessageResult> {
+  const token = getTelegramToken();
+  const timeoutMs = getRuntimeConfig().API_TIMEOUT_MS;
+  const result = await enqueue(async () => {
+    const form = new FormData();
+    form.append("chat_id", String(chatId));
+    if (caption) form.append("caption", caption.slice(0, 1024));
+    const artifact = readSafeArtifactFile(
+      filePath,
+      getSessionCwd(getRuntimeConfig().grokCwdAbs),
+      getRuntimeConfig().MEDIA_MAX_BYTES,
+    );
+    form.append("document", new Blob([artifact.bytes]), artifact.name);
+    const res = await fetch(`https://api.telegram.org/bot${token}/sendDocument`, {
+      method: "POST",
+      body: form,
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!res.ok) {
+      throw new TelegramApiError(`Telegram API sendDocument failed: ${res.status}`, res.status);
+    }
+    const json = parseApiEnvelope(await res.json());
+    if (!json.ok) {
+      throw new TelegramApiError(
+        `Telegram API sendDocument returned ok=false: ${sanitizedError(json.description ?? "unknown")}`,
+        0,
+      );
+    }
+    return json.result;
+  });
+  return requireMessageResult(result);
 }
 
 export function startTyping(chatIds: number[]): void {
@@ -677,11 +795,12 @@ function describeTool(title: string | null | undefined, rawInput: unknown): stri
 function scheduleBubbleUpdate(): void {
   if (!bubbleActive) return;
   if (bubbleDebounceTimer) clearTimeout(bubbleDebounceTimer);
+  const debounce = getRuntimeConfig().BUBBLE_DEBOUNCE_MS;
   bubbleDebounceTimer = setTimeout(() => {
     void flushBubble().catch((error: unknown) => {
       console.error(`[TG] Tool progress bubble failed: ${sanitizedError(error)}`);
     });
-  }, BUBBLE_DEBOUNCE_MS);
+  }, debounce);
 }
 
 function rememberBubbleMessage(chatId: number, messageId: number): void {
@@ -773,6 +892,7 @@ export function trackToolCall(
   rawInput: unknown,
 ): void {
   if (getAuthorizedActiveChat() == null) return;
+  toolsSeenCount += 1;
   const desc = describeTool(title, rawInput);
   if (desc) {
     activeTools.set(toolCallId, { name: title || "tool", description: desc });
@@ -788,6 +908,152 @@ export function updateToolCall(toolCallId: string, status?: ToolCallStatus | nul
     activeTools.delete(toolCallId);
     scheduleBubbleUpdate();
   }
+}
+
+export function getToolsSeenCount(): number {
+  return toolsSeenCount;
+}
+
+async function getFilePath(fileId: string): Promise<string> {
+  const result = await enqueue(() =>
+    callApi("getFile", { file_id: fileId }, getTelegramToken()));
+  if (!result || typeof result !== "object" || !("file_path" in result)) {
+    throw new Error("Telegram getFile returned no file_path");
+  }
+  const path = (result as { file_path?: string }).file_path;
+  if (!path) throw new Error("Telegram getFile returned empty file_path");
+  return path;
+}
+
+async function downloadAttachment(
+  config: Config,
+  fileId: string,
+  originalName: string,
+  telegramMime?: string | null,
+  telegramSize?: number,
+): Promise<InboxFile> {
+  const name = originalName || "attachment";
+  const mime = guessMime(name, telegramMime);
+  if (!isAllowedMime(mime, config.mimeAllowlist)) {
+    throw new Error(`MIME type not allowed: ${mime}`);
+  }
+  if (telegramSize != null && telegramSize > config.MEDIA_MAX_BYTES) {
+    throw new Error(`File too large (${telegramSize} bytes; max ${config.MEDIA_MAX_BYTES})`);
+  }
+  const remotePath = await getFilePath(fileId);
+  const bytes = await downloadTelegramFileBytes(
+    getTelegramToken(),
+    remotePath,
+    config.MEDIA_MAX_BYTES,
+    config.API_TIMEOUT_MS,
+  );
+  const file = writeInboxFile(getSessionCwd(config.grokCwdAbs), name || basename(remotePath), bytes);
+  file.mime = mime;
+  return file;
+}
+
+interface MediaExtraction {
+  files: InboxFile[];
+  errors: string[];
+}
+
+async function extractMediaFromMessage(
+  config: Config,
+  message: Message,
+): Promise<MediaExtraction> {
+  const files: InboxFile[] = [];
+  const errors: string[] = [];
+
+  try {
+    if (message.photo && Array.isArray(message.photo) && message.photo.length > 0) {
+      const largest = message.photo[message.photo.length - 1];
+      if (largest?.file_id) {
+        files.push(await downloadAttachment(
+          config,
+          largest.file_id,
+          "photo.jpg",
+          "image/jpeg",
+          largest.file_size,
+        ));
+      }
+    }
+    if (message.document?.file_id) {
+      const doc = message.document;
+      files.push(await downloadAttachment(
+        config,
+        doc.file_id,
+        doc.file_name || "document",
+        doc.mime_type,
+        doc.file_size,
+      ));
+    }
+    if (message.voice?.file_id) {
+      files.push(await downloadAttachment(
+        config,
+        message.voice.file_id,
+        "voice.ogg",
+        message.voice.mime_type || "audio/ogg",
+        message.voice.file_size,
+      ));
+    }
+    if (message.audio?.file_id) {
+      files.push(await downloadAttachment(
+        config,
+        message.audio.file_id,
+        message.audio.file_name || "audio",
+        message.audio.mime_type,
+        message.audio.file_size,
+      ));
+    }
+    if (message.video?.file_id) {
+      files.push(await downloadAttachment(
+        config,
+        message.video.file_id,
+        message.video.file_name || "video.mp4",
+        message.video.mime_type || "video/mp4",
+        message.video.file_size,
+      ));
+    }
+  } catch (error: unknown) {
+    errors.push(sanitizedError(error));
+  }
+
+  return { files, errors };
+}
+
+function replyContextFromMessage(
+  message: Message,
+): string | null {
+  const reply = message.reply_to_message;
+  if (!reply) return null;
+  const parts: string[] = [];
+  if (reply.text) parts.push(reply.text);
+  if (reply.caption) parts.push(reply.caption);
+  if (reply.photo) parts.push("[photo]");
+  if (reply.document) parts.push(`[document: ${reply.document.file_name || "file"}]`);
+  return parts.join("\n").slice(0, 2000) || null;
+}
+
+function messageHasMedia(message: Message): boolean {
+  return Boolean(
+    message.photo?.length
+      || message.document
+      || message.voice
+      || message.audio
+      || message.video,
+  );
+}
+
+function requireAuthorizedPrivate(
+  ctx: Context,
+  config: Config,
+): { chatId: number; userId: number } | null {
+  if (ctx.chat?.type !== "private") return null;
+  const userId = ctx.from?.id;
+  if (userId == null) return null;
+  const access = reloadAccess(config);
+  if (!isAllowed(access, userId)) return null;
+  return { chatId: ctx.chat.id, userId };
 }
 
 export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
@@ -807,51 +1073,98 @@ export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
     const help = [
       "Grok Build Telegram Bridge",
       "",
-      "Send any message to prompt Grok Build.",
-      "While working, send /cancel to stop, /status for health, /new for fresh session.",
-      "Permission cards show once/session/reject choices when ACP offers them and update after selection.",
+      "Send text, photos, documents, voice, or video to prompt Grok Build.",
+      "Bridge commands:",
+      "  /status — health, queue, cwd, usage",
+      "  /cancel [queue] — stop active prompt; add queue to clear queue",
+      "  /new — fresh ACP session",
+      "  /retry last — re-send last response without re-running",
+      "  /verbose on|off — thought stream",
+      "  /cwd [n|path] — list or switch allowed working directories",
       "",
-      "Pairing: first message from unknown user generates a code shown in the terminal.",
+      "Other messages are forwarded as prompts (including Grok slash-style text).",
+      "While busy, follow-ups are queued (see PROMPT_QUEUE_MAX).",
+      "Permission cards: once / session / reject (or reply approve/reject).",
+      "",
+      "Pairing: first message from an unknown user prints a code in the bridge terminal.",
     ].join("\n");
     await sendMessage(ctx.chat.id, help);
   });
 
   bot.command("status", async (ctx) => {
-    const userId = ctx.from?.id;
-    const access = reloadAccess(config);
-    if (ctx.chat.type !== "private" || !userId || !isAllowed(access, userId)) {
+    const auth = requireAuthorizedPrivate(ctx, config);
+    if (!auth) {
       await sendMessage(ctx.chat.id, "Not authorized.");
       return;
     }
-    await deps.onStatus(ctx.chat.id);
+    await deps.onStatus(auth.chatId);
   });
 
   bot.command("cancel", async (ctx) => {
-    const userId = ctx.from?.id;
-    const access = reloadAccess(config);
-    if (ctx.chat.type !== "private" || !userId || !isAllowed(access, userId)) {
+    const auth = requireAuthorizedPrivate(ctx, config);
+    if (!auth) {
       await sendMessage(ctx.chat.id, "Not authorized.");
       return;
     }
-    const cancelled = await deps.onCancel(ctx.chat.id, userId);
-    await sendMessage(
-      ctx.chat.id,
-      cancelled ? "Cancel requested." : "No active prompt owned by this chat.",
-    );
+    const arg = (ctx.match && String(ctx.match).trim().toLowerCase()) || "";
+    const clearQueue = arg === "queue" || arg === "all";
+    const result = await deps.onCancel(auth.chatId, auth.userId, clearQueue);
+    if (!result.cancelled && !result.queueCleared) {
+      await sendMessage(auth.chatId, "No active prompt owned by this chat.");
+    } else if (!result.cancelled && result.queueCleared) {
+      await sendMessage(auth.chatId, `Cleared ${result.queueCleared} queued prompt(s).`);
+    }
   });
 
   bot.command("new", async (ctx) => {
-    const userId = ctx.from?.id;
-    const access = reloadAccess(config);
-    if (ctx.chat.type !== "private" || !userId || !isAllowed(access, userId)) {
+    const auth = requireAuthorizedPrivate(ctx, config);
+    if (!auth) {
       await sendMessage(ctx.chat.id, "Not authorized.");
       return;
     }
-    const reset = await deps.onNewSession(ctx.chat.id, userId);
+    const reset = await deps.onNewSession(auth.chatId, auth.userId);
     await sendMessage(
-      ctx.chat.id,
+      auth.chatId,
       reset ? "New session started." : "Can't reset a session owned by another chat.",
     );
+  });
+
+  bot.command("retry", async (ctx) => {
+    const auth = requireAuthorizedPrivate(ctx, config);
+    if (!auth) {
+      await sendMessage(ctx.chat.id, "Not authorized.");
+      return;
+    }
+    const arg = (ctx.match && String(ctx.match).trim().toLowerCase()) || "";
+    if (arg !== "last") {
+      await sendMessage(auth.chatId, "Usage: /retry last");
+      return;
+    }
+    await deps.onRetryLast(auth.chatId);
+  });
+
+  bot.command("verbose", async (ctx) => {
+    const auth = requireAuthorizedPrivate(ctx, config);
+    if (!auth) {
+      await sendMessage(ctx.chat.id, "Not authorized.");
+      return;
+    }
+    const arg = (ctx.match && String(ctx.match).trim().toLowerCase()) || "";
+    if (arg !== "on" && arg !== "off") {
+      await sendMessage(auth.chatId, "Usage: /verbose on|off");
+      return;
+    }
+    await deps.onSetVerbose(auth.chatId, arg === "on");
+  });
+
+  bot.command("cwd", async (ctx) => {
+    const auth = requireAuthorizedPrivate(ctx, config);
+    if (!auth) {
+      await sendMessage(ctx.chat.id, "Not authorized.");
+      return;
+    }
+    const arg = (ctx.match && String(ctx.match).trim()) || "";
+    await deps.onSetCwd(auth.chatId, arg || null);
   });
 
   bot.on("callback_query:data", async (ctx) => {
@@ -866,7 +1179,28 @@ export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
       await answerCallbackQuery(ctx.callbackQuery.id, "Not authorized", true);
       return;
     }
-    const [, action, id, optionIndex] = data.split(":", 4);
+
+    const parts = data.split(":");
+    const action = parts[1];
+
+    // Stale prompt recovery
+    if (action === "s") {
+      const promptId = parts[2] ?? "";
+      const staleAction = parts[3] === "cancel" ? "cancel" : parts[3] === "keep" ? "keep" : null;
+      if (!promptId || !staleAction || !ctx.chat || !ctx.from) {
+        await answerCallbackQuery(ctx.callbackQuery.id, "Unknown action");
+        return;
+      }
+      const ok = await deps.onStaleAction(ctx.chat.id, ctx.from.id, promptId, staleAction);
+      await answerCallbackQuery(
+        ctx.callbackQuery.id,
+        ok ? (staleAction === "cancel" ? "Cancelling…" : "Keeping…") : "Not applicable",
+      );
+      return;
+    }
+
+    const id = parts[2] ?? "";
+    const optionIndex = parts[3];
     const pp = getPendingPermission();
     const active = getActivePrompt();
     const callbackMessage = ctx.callbackQuery.message;
@@ -944,6 +1278,16 @@ export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
     const userId = ctx.from?.id;
     if (userId == null) return;
 
+    // Skip command messages already handled by bot.command (they also hit message)
+    if (message.text?.startsWith("/")) {
+      const cmd = message.text.split(/\s+/)[0]?.split("@")[0];
+      if (cmd && [
+        "/start", "/help", "/status", "/cancel", "/new", "/retry", "/verbose", "/cwd",
+      ].includes(cmd)) {
+        return;
+      }
+    }
+
     const text = message.text || message.caption || "";
     const access = reloadAccess(config);
 
@@ -956,7 +1300,8 @@ export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
       const allowAlways = /^(always|always approve|approve always)$/.test(norm);
       const rejectOnce = /^(reject|no|n|deny)$/.test(norm);
       const rejectAlways = /^(always reject|reject always|always deny|deny always)$/.test(norm);
-      if (active?.userId === userId && active.chatId === chatId && (allowOnce || allowAlways || rejectOnce || rejectAlways)) {
+      if (active?.userId === userId && active.chatId === chatId
+        && (allowOnce || allowAlways || rejectOnce || rejectAlways)) {
         const options = pp.rawRequest?.options ?? [];
         let selection: { decision: RequestPermissionResponse; label: string } | null;
         if (allowAlways) {
@@ -974,7 +1319,11 @@ export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
           return;
         }
         const resolved = deps.resolvePermission
-          ? await deps.resolvePermission(selection.decision, selection.label, ctx.from?.first_name || "Telegram")
+          ? await deps.resolvePermission(
+            selection.decision,
+            selection.label,
+            ctx.from?.first_name || "Telegram",
+          )
           : false;
         if (!resolved) {
           await sendMessage(chatId, "That approval has already been handled or expired.");
@@ -1020,29 +1369,102 @@ export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
       return;
     }
 
-    if (getActivePrompt()) {
-      await sendMessage(chatId, "Grok is still working on the previous prompt. Use /cancel or wait.");
+    if (deps.canAcceptPrompts && !deps.canAcceptPrompts()) {
+      await sendMessage(chatId, "Bridge is shutting down. Try again after it restarts.");
       return;
     }
 
-    // ack + start
+    if (getActivePrompt() && messageHasMedia(message)) {
+      await sendMessage(
+        chatId,
+        "Media follow-ups are not queued. Wait for the active prompt or use /cancel first.",
+      );
+      return;
+    }
+
+    // Authorized prompt path — download media first
+    const media = await extractMediaFromMessage(config, message);
+    if (media.errors.length) {
+      await sendMessage(chatId, `Could not process attachment: ${media.errors[0]}`);
+      cleanupInboxFiles(media.files.map((f) => f.path));
+      return;
+    }
+
+    const replyContext = replyContextFromMessage(message);
+    const promptText = text.trim()
+      || (media.files.length ? "User sent media. Please inspect the attached files." : "");
+
+    if (!promptText && media.files.length === 0) {
+      await sendMessage(chatId, "Send text or an attachment to prompt Grok Build.");
+      return;
+    }
+
+    const payload: PromptPayload = {
+      text: promptText,
+      replyContext,
+      inboxFiles: media.files,
+    };
+
+    if (getActivePrompt()) {
+      if (media.files.length > 0) {
+        cleanupInboxFiles(media.files.map((file) => file.path));
+        await sendMessage(
+          chatId,
+          "Media follow-ups are not queued. Wait for the active prompt or use /cancel first.",
+        );
+        return;
+      }
+      if (config.PROMPT_QUEUE_MAX <= 0) {
+        await sendMessage(chatId, "Grok is still working on the previous prompt. Use /cancel or wait.");
+        cleanupInboxFiles(media.files.map((f) => f.path));
+        return;
+      }
+      const queued = enqueuePrompt({
+        chatId,
+        userId,
+        messageId: message.message_id || 0,
+        text: payload.text,
+        replyContext: payload.replyContext,
+        inboxFiles: payload.inboxFiles,
+      }, config.PROMPT_QUEUE_MAX);
+      if (!queued.ok) {
+        await sendMessage(
+          chatId,
+          `Queue full (${config.PROMPT_QUEUE_MAX}). Use /cancel or wait.`,
+        );
+        cleanupInboxFiles(media.files.map((f) => f.path));
+        return;
+      }
+      await sendMessage(
+        chatId,
+        `Queued (${queued.position}/${config.PROMPT_QUEUE_MAX}). Use /cancel queue to clear.`,
+      );
+      return;
+    }
+
+    // Start promptly
     if (message.message_id) {
       void setMessageReaction(chatId, message.message_id, "👀").catch((error: unknown) => {
         console.warn(`[TG] Failed to acknowledge prompt: ${sanitizedError(error)}`);
       });
     }
-    const allChats = [chatId];
+    toolsSeenCount = 0;
     resetStreamDraftState();
-    startTyping(allChats);
+    startTyping([chatId]);
     bubbleActive = true;
-    startActivePrompt(chatId, message.message_id || 0, userId);
+    startActivePrompt(
+      chatId,
+      message.message_id || 0,
+      userId,
+      payload.inboxFiles.map((f) => f.path),
+    );
 
-    const promptText = text || "User sent a non-text message.";
-    void deps.onPrompt(chatId, promptText, userId).catch(async (error: unknown) => {
+    void deps.onPrompt(chatId, payload, userId).catch(async (error: unknown) => {
       console.error(`[TG] Prompt handler failed: ${sanitizedError(error)}`);
       clearActivePrompt();
       stopTyping();
       resetStreamDraftState();
+      cleanupInboxFiles(payload.inboxFiles.map((f) => f.path));
       try {
         await sendMessage(
           chatId,
@@ -1065,7 +1487,6 @@ export async function stopPolling(bot: Bot): Promise<void> {
   }
 }
 
-// health status lines for /status
 export function healthStatusLines(extra: HealthSnapshotInput): string[] {
   const ap = getActivePrompt();
   const pp = getPendingPermission();
@@ -1089,7 +1510,6 @@ export function healthStatusLines(extra: HealthSnapshotInput): string[] {
     `  Typing active: ${extra.typingActive && typingAgeMs != null ? `yes (${formatAge(typingAgeMs).replace(" ago", "")})` : "no"}`,
     `  Active prompt: ${ap ? `yes (${formatAge(ap.startedAt).replace(" ago", "")})` : "no"}`,
     `  Pending permission: ${pp ? `${pp.kind} waiting ${formatAge(pp.startedAt).replace(" ago", "")}` : "no"}`,
-    `  ACP session: ${extra.acpSessionId || "none"}`,
     `  Likely state: ${likelyState}`,
   ];
   return lines;
@@ -1121,6 +1541,7 @@ export function resetTelegramRuntimeForTests() {
   allBubbleIds.clear();
   activeTools.clear();
   lastCompletedToolDesc = null;
+  toolsSeenCount = 0;
 }
 
 export function setTelegramRuntimeForTests(token: string, config: Config): void {

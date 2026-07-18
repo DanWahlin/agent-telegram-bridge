@@ -1,10 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createTelegramBot, resetTelegramRuntimeForTests } from "./telegram.js";
 import {
   clearActivePrompt,
+  resetRuntimeStateForTests,
   saveAccess,
   setPendingPermission,
   startActivePrompt,
@@ -20,9 +21,13 @@ function makeDeps(config: Config) {
   return {
     config,
     onPrompt: vi.fn(async () => {}),
-    onCancel: vi.fn(async () => true),
+    onCancel: vi.fn(async () => ({ cancelled: true, queueCleared: 0 })),
     onNewSession: vi.fn(async () => true),
     onStatus: vi.fn(async () => {}),
+    onRetryLast: vi.fn(async () => {}),
+    onSetVerbose: vi.fn(async () => {}),
+    onSetCwd: vi.fn(async () => {}),
+    onStaleAction: vi.fn(async () => true),
   };
 }
 
@@ -56,7 +61,102 @@ describe("Telegram authorization and prompt dispatch", () => {
       expect(deps.onPrompt).not.toHaveBeenCalled();
       expect(replies).toContain("This bridge only works in private chats.");
       resetTelegramRuntimeForTests();
+      resetRuntimeStateForTests();
     } finally {
+      vi.unstubAllGlobals();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects unauthorized media before calling Telegram getFile", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "grok-tg-media-auth-"));
+    try {
+      const config = makeConfig(dir);
+      saveAccess(config, { allowedUsers: ["42"], pending: {} });
+      const deps = makeDeps(config);
+      const bot = createTelegramBot(config, deps);
+      (bot as any).botInfo = { id: 999, is_bot: true, first_name: "Test", username: "test_bot", can_join_groups: false, can_read_all_group_messages: false, supports_inline_queries: false };
+      const methods: string[] = [];
+      vi.stubGlobal("fetch", vi.fn(async (input: string | URL) => {
+        methods.push(String(input).split("/").pop() ?? "");
+        return new Response(JSON.stringify({ ok: true, result: { message_id: 1 } }));
+      }));
+
+      await bot.handleUpdate({
+        update_id: 6,
+        message: {
+          message_id: 6,
+          date: 0,
+          photo: [{ file_id: "photo-1", file_unique_id: "unique-1", width: 10, height: 10 }],
+          chat: { id: 43, type: "private", first_name: "Other" },
+          from: { id: 43, is_bot: false, first_name: "Other" },
+        },
+      } as any);
+
+      expect(methods).not.toContain("getFile");
+      expect(deps.onPrompt).not.toHaveBeenCalled();
+    } finally {
+      resetTelegramRuntimeForTests();
+      resetRuntimeStateForTests();
+      vi.unstubAllGlobals();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("downloads an authorized photo and forwards its caption as a prompt", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "grok-tg-media-"));
+    try {
+      const config = makeConfig(dir);
+      saveAccess(config, { allowedUsers: ["42"], pending: {} });
+      const deps = makeDeps(config);
+      const bot = createTelegramBot(config, deps);
+      (bot as any).botInfo = { id: 999, is_bot: true, first_name: "Test", username: "test_bot", can_join_groups: false, can_read_all_group_messages: false, supports_inline_queries: false };
+      vi.stubGlobal("fetch", vi.fn(async (input: string | URL) => {
+        const url = String(input);
+        if (url.endsWith("/getFile")) {
+          return new Response(JSON.stringify({
+            ok: true,
+            result: { file_path: "photos/photo-1.jpg" },
+          }));
+        }
+        if (url.includes("/file/bot")) {
+          return new Response(new Uint8Array([0xff, 0xd8, 0xff, 0xd9]), {
+            status: 200,
+            headers: { "content-length": "4" },
+          });
+        }
+        return new Response(JSON.stringify({ ok: true, result: true }));
+      }));
+
+      await bot.handleUpdate({
+        update_id: 7,
+        message: {
+          message_id: 7,
+          date: 0,
+          caption: "What is in this photo?",
+          photo: [{
+            file_id: "photo-1",
+            file_unique_id: "unique-1",
+            file_size: 4,
+            width: 10,
+            height: 10,
+          }],
+          chat: { id: 42, type: "private", first_name: "Dan" },
+          from: { id: 42, is_bot: false, first_name: "Dan" },
+        },
+      } as any);
+
+      expect(deps.onPrompt).toHaveBeenCalledOnce();
+      const payload = deps.onPrompt.mock.calls[0]?.[1];
+      expect(payload?.text).toBe("What is in this photo?");
+      expect(payload?.inboxFiles).toHaveLength(1);
+      const filePath = payload?.inboxFiles[0]?.path;
+      expect(filePath && existsSync(filePath)).toBe(true);
+      expect(filePath ? statSync(filePath).mode & 0o777 : 0).toBe(0o600);
+      if (filePath) rmSync(filePath, { force: true });
+    } finally {
+      resetTelegramRuntimeForTests();
+      resetRuntimeStateForTests();
       vi.unstubAllGlobals();
       rmSync(dir, { recursive: true, force: true });
     }
@@ -93,9 +193,85 @@ describe("Telegram authorization and prompt dispatch", () => {
         new Promise((resolve) => setTimeout(() => resolve("blocked"), 250)),
       ])).resolves.toBe("handled");
       expect(deps.onPrompt).toHaveBeenCalledOnce();
+      const payload = deps.onPrompt.mock.calls[0]?.[1];
+      expect(payload).toMatchObject({ text: "long task" });
       release();
       resetTelegramRuntimeForTests();
+      resetRuntimeStateForTests();
     } finally {
+      vi.unstubAllGlobals();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("queues a second prompt while one is active", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "grok-tg-queue-"));
+    try {
+      const config = makeConfig(dir);
+      saveAccess(config, { allowedUsers: ["42"], pending: {} });
+      startActivePrompt(42, 1, 42);
+      const deps = makeDeps(config);
+      const bot = createTelegramBot(config, deps);
+      (bot as any).botInfo = { id: 999, is_bot: true, first_name: "Test", username: "test_bot", can_join_groups: false, can_read_all_group_messages: false, supports_inline_queries: false };
+      const replies: string[] = [];
+      vi.stubGlobal("fetch", vi.fn(async (_input: string | URL, init?: RequestInit) => {
+        const body = init?.body ? JSON.parse(String(init.body)) as { text?: string } : {};
+        if (body.text) replies.push(body.text);
+        return new Response(JSON.stringify({ ok: true, result: { message_id: 1 } }));
+      }));
+
+      await bot.handleUpdate({
+        update_id: 5,
+        message: {
+          message_id: 5,
+          date: 0,
+          text: "second prompt",
+          chat: { id: 42, type: "private", first_name: "Dan" },
+          from: { id: 42, is_bot: false, first_name: "Dan" },
+        },
+      } as any);
+
+      expect(deps.onPrompt).not.toHaveBeenCalled();
+      expect(replies.some((r) => r.startsWith("Queued ("))).toBe(true);
+      resetTelegramRuntimeForTests();
+      resetRuntimeStateForTests();
+    } finally {
+      vi.unstubAllGlobals();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects media while busy before downloading it", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "grok-tg-busy-media-"));
+    try {
+      const config = makeConfig(dir);
+      saveAccess(config, { allowedUsers: ["42"], pending: {} });
+      startActivePrompt(42, 1, 42);
+      const deps = makeDeps(config);
+      const bot = createTelegramBot(config, deps);
+      (bot as any).botInfo = { id: 999, is_bot: true, first_name: "Test", username: "test_bot", can_join_groups: false, can_read_all_group_messages: false, supports_inline_queries: false };
+      const methods: string[] = [];
+      vi.stubGlobal("fetch", vi.fn(async (input: string | URL) => {
+        methods.push(String(input).split("/").pop() ?? "");
+        return new Response(JSON.stringify({ ok: true, result: { message_id: 1 } }));
+      }));
+
+      await bot.handleUpdate({
+        update_id: 8,
+        message: {
+          message_id: 8,
+          date: 0,
+          photo: [{ file_id: "photo-2", file_unique_id: "unique-2", width: 10, height: 10 }],
+          chat: { id: 42, type: "private", first_name: "Dan" },
+          from: { id: 42, is_bot: false, first_name: "Dan" },
+        },
+      } as any);
+
+      expect(methods).not.toContain("getFile");
+      expect(deps.onPrompt).not.toHaveBeenCalled();
+    } finally {
+      resetTelegramRuntimeForTests();
+      resetRuntimeStateForTests();
       vi.unstubAllGlobals();
       rmSync(dir, { recursive: true, force: true });
     }
@@ -156,6 +332,7 @@ describe("Telegram authorization and prompt dispatch", () => {
       setPendingPermission(null);
       clearActivePrompt();
       resetTelegramRuntimeForTests();
+      resetRuntimeStateForTests();
       vi.unstubAllGlobals();
       rmSync(dir, { recursive: true, force: true });
     }
@@ -207,6 +384,7 @@ describe("Telegram authorization and prompt dispatch", () => {
       clearActivePrompt();
       setPendingPermission(null);
       resetTelegramRuntimeForTests();
+      resetRuntimeStateForTests();
       vi.unstubAllGlobals();
       rmSync(dir, { recursive: true, force: true });
     }

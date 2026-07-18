@@ -1,4 +1,5 @@
 import type { Config } from "./config.js";
+import { defaultMimeAllowlist, parseCwdAllowlist } from "./media.js";
 
 export function createTestConfig(
   stateDir: string,
@@ -8,7 +9,7 @@ export function createTestConfig(
     TELEGRAM_BOT_TOKEN: "123456789:test-token-not-real",
     GROK_CWD: stateDir,
     GROK_BIN: "grok",
-    GROK_MODEL: "grok-build",
+    GROK_MODEL: "grok-4.5",
     STATE_DIR: stateDir,
     GROK_ALWAYS_APPROVE: false,
     PAIRING_EXPIRY_MS: 300_000,
@@ -19,8 +20,8 @@ export function createTestConfig(
     STREAM_EDIT_INTERVAL_MS: 1_500,
     STREAM_MIN_DELTA_CHARS: 24,
     STREAM_DRAFT_MAX: 3_800,
-    PROGRESS_NOTICE_AFTER_MS: 600_000,
-    PROGRESS_NOTICE_INTERVAL_MS: 600_000,
+    PROGRESS_NOTICE_AFTER_MS: 90_000,
+    PROGRESS_NOTICE_INTERVAL_MS: 120_000,
     PROGRESS_NOTICE_ITERATION_MS: 60_000,
     PROGRESS_NOTICE_MAX_ITERATIONS: 90,
     SEND_PACE_MS: 50,
@@ -29,9 +30,21 @@ export function createTestConfig(
     HEALTH_WRITE_MIN_INTERVAL_MS: 5_000,
     API_TIMEOUT_MS: 30_000,
     PERMISSION_SUMMARY_MAX: 1_800,
+    MEDIA_MAX_BYTES: 20 * 1024 * 1024,
+    MEDIA_MIME_ALLOWLIST: "",
+    PROMPT_QUEUE_MAX: 3,
+    CANCEL_WAIT_MS: 15_000,
+    RETRY_LAST_TTL_MS: 30 * 60 * 1000,
+    WATCHDOG_INTERVAL_MS: 30_000,
+    BUBBLE_DEBOUNCE_MS: 300,
+    THOUGHT_EDIT_INTERVAL_MS: 2_500,
+    GROK_CWD_ALLOWLIST: "",
+    VERBOSE_DEFAULT: false,
     stateDir,
     grokCwdAbs: stateDir,
     grokBin: "grok",
+    mimeAllowlist: defaultMimeAllowlist(),
+    cwdAllowlist: parseCwdAllowlist("", stateDir),
     ...overrides,
   };
 }

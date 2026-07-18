@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { Readable, Writable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk";
 import type {
+  ContentBlock,
   PermissionOption,
   PromptResponse,
   RequestPermissionResponse,
@@ -16,8 +17,10 @@ import {
   setPendingPermission,
   updateActivePromptActivity,
   writeHealthSnapshot,
+  getSessionCwd,
   type PendingPermissionState,
 } from "./state.js";
+import type { PromptCapabilities } from "./media.js";
 
 export interface PermissionRequest {
   sessionId: string;
@@ -33,12 +36,17 @@ interface AcpHandlers {
 
 export interface AcpClientHandle {
   connect: () => Promise<void>;
-  sendPrompt: (text: string) => Promise<PromptResponse>;
+  sendPrompt: (prompt: string | ContentBlock | ContentBlock[]) => Promise<PromptResponse>;
   cancelCurrent: () => Promise<void>;
+  waitForIdle: (timeoutMs: number) => Promise<boolean>;
   shutdown: () => Promise<void>;
   restart: () => Promise<void>;
   getSessionId: () => string | null;
   isConnected: () => boolean;
+  isPromptRunning: () => boolean;
+  getPromptCapabilities: () => PromptCapabilities;
+  setCwd: (cwd: string) => void;
+  getCwd: () => string;
 }
 
 export function buildGrokChildEnv(parentEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
@@ -65,6 +73,8 @@ export function createAcpClient(config: Config, handlers: AcpHandlers): AcpClien
   let sessionId: string | null = null;
   let connected = false;
   let promptRunning = false;
+  let promptCapabilities: PromptCapabilities = {};
+  let sessionCwd = getSessionCwd(config.grokCwdAbs);
 
   async function stopChild(): Promise<void> {
     const running = child;
@@ -100,7 +110,7 @@ export function createAcpClient(config: Config, handlers: AcpHandlers): AcpClien
 
     const childEnv = buildGrokChildEnv(process.env);
     child = spawn(config.grokBin, args, {
-      cwd: config.grokCwdAbs,
+      cwd: sessionCwd,
       stdio: ["pipe", "pipe", "pipe"],
       env: childEnv,
       shell: false,
@@ -139,23 +149,35 @@ export function createAcpClient(config: Config, handlers: AcpHandlers): AcpClien
     if (initialized.protocolVersion !== acp.PROTOCOL_VERSION) {
       throw new Error(`Unsupported ACP protocol ${initialized.protocolVersion}`);
     }
-    session = await context.buildSession(config.grokCwdAbs).start();
+    const caps = initialized.agentCapabilities?.promptCapabilities;
+    promptCapabilities = {
+      image: caps?.image === true,
+      audio: caps?.audio === true,
+      embeddedContext: caps?.embeddedContext === true,
+    };
+    session = await context.buildSession(sessionCwd).start();
     sessionId = session.sessionId;
     connected = true;
-    console.log(`[ACP] Grok session ${sessionId} connected with model ${config.GROK_MODEL}`);
+    console.log(
+      `[ACP] Grok session ${sessionId} connected with model ${config.GROK_MODEL} cwd=${sessionCwd} caps=${JSON.stringify(promptCapabilities)}`,
+    );
     writeHealthSnapshot(config, "acp-session-created", {
       connected: true,
       acpSessionId: sessionId,
     }, { force: true });
   }
 
-  async function sendPrompt(text: string): Promise<PromptResponse> {
+  async function sendPrompt(
+    prompt: string | ContentBlock | ContentBlock[],
+  ): Promise<PromptResponse> {
     await connect();
-    if (!session || promptRunning) throw new Error(promptRunning ? "A prompt is already active" : "No ACP session");
+    if (!session || promptRunning) {
+      throw new Error(promptRunning ? "A prompt is already active" : "No ACP session");
+    }
     promptRunning = true;
     try {
       handlers.onEvent("prompt.sent");
-      const completion = session.prompt(text);
+      const completion = session.prompt(prompt);
       for (;;) {
         const message = await session.nextUpdate();
         if (message.kind === "stop") {
@@ -177,6 +199,14 @@ export function createAcpClient(config: Config, handlers: AcpHandlers): AcpClien
     if (!context || !sessionId || !promptRunning) return;
     await context.notify(acp.methods.agent.session.cancel, { sessionId });
     handlers.onEvent("prompt.cancelled");
+  }
+
+  async function waitForIdle(timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (promptRunning && Date.now() < deadline) {
+      await sleep(100);
+    }
+    return !promptRunning;
   }
 
   async function shutdown(): Promise<void> {
@@ -205,10 +235,17 @@ export function createAcpClient(config: Config, handlers: AcpHandlers): AcpClien
     connect,
     sendPrompt,
     cancelCurrent,
+    waitForIdle,
     shutdown,
     restart,
     getSessionId: () => sessionId,
     isConnected: () => connected,
+    isPromptRunning: () => promptRunning,
+    getPromptCapabilities: () => promptCapabilities,
+    setCwd: (cwd: string) => {
+      sessionCwd = cwd;
+    },
+    getCwd: () => sessionCwd,
   };
 }
 
