@@ -27,18 +27,28 @@ import { buildGrokChildEnv } from "./acp-client.js";
 import {
   buildPromptBlocks,
   formatPlanText,
-  resolveSafePath,
-  resolveSafeArtifactPath,
-  artifactFitsLimit,
-  readSafeArtifactFile,
-  extractPathsFromUnknown,
   downloadTelegramFileBytes,
   writeInboxFile,
   cleanupInboxFiles,
   isAllowedMime,
   defaultMimeAllowlist,
+  captureRootIdentity,
+  validateRootIdentity,
+  ensureInboxDir,
 } from "./media.js";
-import { mkdtempSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  linkSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -167,11 +177,39 @@ describe("access and locks", () => {
       timer,
       resolve,
       messages: [],
+      connectionGeneration: 1,
+      promptEpoch: 1,
     });
 
     const cancelled = cancelPendingPermissionState();
 
     expect(cancelled?.id).toBe("permission-1");
+    expect(getPendingPermission()).toBeNull();
+    expect(resolve).toHaveBeenCalledWith({ outcome: { outcome: "cancelled" } });
+    resetRuntimeStateForTests();
+  });
+
+  it("does not let stale connection or prompt generations cancel a current permission", () => {
+    const resolve = vi.fn();
+    const timer = setTimeout(() => undefined, 60_000);
+    setPendingPermission({
+      id: "permission-current",
+      kind: "tool",
+      summary: "Run current command",
+      startedAt: new Date().toISOString(),
+      timer,
+      resolve,
+      messages: [],
+      connectionGeneration: 7,
+      promptEpoch: 11,
+    });
+
+    expect(cancelPendingPermissionState(6, 11)).toBeNull();
+    expect(cancelPendingPermissionState(7, 10)).toBeNull();
+    expect(getPendingPermission()?.id).toBe("permission-current");
+    expect(resolve).not.toHaveBeenCalled();
+
+    expect(cancelPendingPermissionState(7, 11)?.id).toBe("permission-current");
     expect(getPendingPermission()).toBeNull();
     expect(resolve).toHaveBeenCalledWith({ outcome: { outcome: "cancelled" } });
     resetRuntimeStateForTests();
@@ -185,45 +223,109 @@ describe("access and locks", () => {
 });
 
 describe("media and prompt blocks", () => {
-  it("keeps resolved paths inside the working directory", () => {
-    const dir = mkdtempSync(join(tmpdir(), "grok-tg-path-"));
+  it("rejects a session root whose pathname is replaced", () => {
+    const parent = mkdtempSync(join(tmpdir(), "grok-tg-root-"));
     try {
-      const inside = join(dir, "note.txt");
-      writeFileSync(inside, "hi");
-      expect(resolveSafePath(inside, dir)).toBe(inside);
-      expect(resolveSafePath("/etc/passwd", dir)).toBeNull();
-      expect(resolveSafePath(join(dir, "../outside.txt"), dir)).toBeNull();
+      const rootPath = join(parent, "root");
+      const movedPath = join(parent, "moved");
+      const outsidePath = join(parent, "outside");
+      mkdirSync(rootPath);
+      mkdirSync(outsidePath);
+      const identity = captureRootIdentity(rootPath);
+      renameSync(rootPath, movedPath);
+      symlinkSync(outsidePath, rootPath);
+      expect(() => validateRootIdentity(identity)).toThrow(/identity changed/);
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(parent, { recursive: true, force: true });
     }
   });
 
-  it("revalidates outbound artifacts and blocks sensitive or replaced paths", () => {
-    const dir = mkdtempSync(join(tmpdir(), "grok-tg-artifact-"));
-    const outsideDir = mkdtempSync(join(tmpdir(), "grok-tg-artifact-outside-"));
+  it("refuses a symlinked inbox control file", () => {
+    const parent = mkdtempSync(join(tmpdir(), "grok-tg-inbox-control-"));
     try {
-      const report = join(dir, "report.pdf");
-      const secret = join(dir, ".env");
-      const outside = join(outsideDir, "outside.pdf");
-      const swapped = join(dir, "swapped.pdf");
-      writeFileSync(report, "report");
-      writeFileSync(secret, "TOKEN=secret");
-      writeFileSync(outside, "outside");
-      symlinkSync(outside, swapped);
+      const root = captureRootIdentity(parent);
+      const dir = ensureInboxDir(root);
+      const outside = join(parent, "outside.txt");
+      writeFileSync(outside, "sentinel");
+      rmSync(join(dir, ".gitignore"), { force: true });
+      symlinkSync(outside, join(dir, ".gitignore"));
 
-      expect(resolveSafeArtifactPath(report, dir)).toBe(report);
-      expect(resolveSafeArtifactPath(secret, dir)).toBeNull();
-      expect(resolveSafeArtifactPath(swapped, dir)).toBeNull();
-      expect(artifactFitsLimit(report, 6)).toBe(true);
-      expect(artifactFitsLimit(report, 5)).toBe(false);
-      expect(readSafeArtifactFile(report, dir, 6).bytes.toString()).toBe("report");
-      expect(() => readSafeArtifactFile(report, dir, 5)).toThrow(/Artifact too large/);
-      expect(() => readSafeArtifactFile(swapped, dir, 100)).toThrow(/outside the active CWD/);
-      expect(extractPathsFromUnknown({ path: report }, dir)).toEqual([report]);
-      expect(extractPathsFromUnknown({ message: `saved ${report}` }, dir)).toEqual([]);
+      expect(() => ensureInboxDir(root)).toThrow();
+      expect(readFileSync(outside, "utf8")).toBe("sentinel");
     } finally {
-      rmSync(dir, { recursive: true, force: true });
-      rmSync(outsideDir, { recursive: true, force: true });
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a hard-linked inbox control file before truncation", () => {
+    const parent = mkdtempSync(join(tmpdir(), "grok-tg-inbox-hardlink-"));
+    try {
+      const root = captureRootIdentity(parent);
+      const dir = ensureInboxDir(root);
+      const outside = join(parent, "outside.txt");
+      writeFileSync(outside, "sentinel");
+      rmSync(join(dir, ".gitignore"), { force: true });
+      linkSync(outside, join(dir, ".gitignore"));
+
+      expect(() => ensureInboxDir(root)).toThrow(/singly linked/);
+      expect(readFileSync(outside, "utf8")).toBe("sentinel");
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("repairs permissive inbox directory permissions", () => {
+    const parent = mkdtempSync(join(tmpdir(), "grok-tg-inbox-mode-"));
+    try {
+      const root = captureRootIdentity(parent);
+      const dir = join(parent, ".tg-inbox");
+      mkdirSync(dir, { mode: 0o777 });
+      chmodSync(dir, 0o777);
+
+      ensureInboxDir(root);
+      expect(statSync(dir).mode & 0o777).toBe(0o700);
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects reads and cleanup after the inbox directory is swapped", () => {
+    const parent = mkdtempSync(join(tmpdir(), "grok-tg-inbox-swap-"));
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const root = captureRootIdentity(parent);
+      const file = writeInboxFile(root, "note.txt", Buffer.from("trusted"));
+      const inbox = join(parent, ".tg-inbox");
+      const moved = join(parent, "moved-inbox");
+      const outside = join(parent, "outside");
+      renameSync(inbox, moved);
+      mkdirSync(outside);
+      const outsideFile = join(outside, file.name);
+      writeFileSync(outsideFile, "outside");
+      symlinkSync(outside, inbox);
+
+      expect(() => buildPromptBlocks({ text: "inspect", files: [file], capabilities: {} }))
+        .toThrow();
+      cleanupInboxFiles([file]);
+      expect(existsSync(outsideFile)).toBe(true);
+      expect(readFileSync(outsideFile, "utf8")).toBe("outside");
+    } finally {
+      warning.mockRestore();
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects same-inode attachment tampering after admission", () => {
+    const parent = mkdtempSync(join(tmpdir(), "grok-tg-inbox-content-"));
+    try {
+      const file = writeInboxFile(captureRootIdentity(parent), "note.txt", Buffer.from("trusted"));
+      writeFileSync(file.path, "changed", { mode: 0o600 });
+
+      expect(() => buildPromptBlocks({ text: "inspect", files: [file], capabilities: {} }))
+        .toThrow(/content changed/);
+      cleanupInboxFiles([file]);
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
     }
   });
 
@@ -247,7 +349,7 @@ describe("media and prompt blocks", () => {
   it("builds image content blocks when the agent advertises image prompts", () => {
     const dir = mkdtempSync(join(tmpdir(), "grok-tg-blocks-"));
     try {
-      const file = writeInboxFile(dir, "shot.png", Buffer.from("fake-png"));
+      const file = writeInboxFile(captureRootIdentity(dir), "shot.png", Buffer.from("fake-png"));
       file.mime = "image/png";
       const { blocks } = buildPromptBlocks({
         text: "what is this?",
@@ -256,8 +358,50 @@ describe("media and prompt blocks", () => {
       });
       expect(blocks.some((b) => b.type === "image")).toBe(true);
       expect(blocks.some((b) => b.type === "text" && b.text.includes("what is this"))).toBe(true);
-      cleanupInboxFiles([file.path]);
+      cleanupInboxFiles([file]);
     } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("retires the admitted opened file without touching a swapped pathname", () => {
+    const parent = mkdtempSync(join(tmpdir(), "grok-tg-cleanup-swap-"));
+    try {
+      const root = captureRootIdentity(parent);
+      const file = writeInboxFile(root, "note.txt", Buffer.from("trusted"));
+      const retiredPath = join(parent, ".tg-inbox", "retired-original");
+      renameSync(file.path, retiredPath);
+      writeFileSync(file.path, "replacement");
+
+      cleanupInboxFiles([file]);
+
+      expect(readFileSync(file.path, "utf8")).toBe("replacement");
+      const retired = statSync(retiredPath);
+      expect(retired.size).toBe(0);
+      expect(retired.mode & 0o777).toBe(0);
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps fallback resource links bound to the admitted file descriptor", () => {
+    const dir = mkdtempSync(join(tmpdir(), "grok-tg-descriptor-link-"));
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const file = writeInboxFile(captureRootIdentity(dir), "note.txt", Buffer.from("trusted"));
+      const { blocks } = buildPromptBlocks({ text: "inspect", files: [file], capabilities: {} });
+      const link = blocks.find((block) => block.type === "resource_link");
+      expect(link?.type).toBe("resource_link");
+      if (!link || link.type !== "resource_link") throw new Error("resource link missing");
+      const descriptorPath = new URL(link.uri).pathname;
+
+      renameSync(join(dir, ".tg-inbox"), join(dir, ".tg-inbox-moved"));
+      expect(readFileSync(descriptorPath, "utf8")).toBe("trusted");
+
+      cleanupInboxFiles([file]);
+      expect(() => readFileSync(descriptorPath)).toThrow();
+    } finally {
+      warning.mockRestore();
       rmSync(dir, { recursive: true, force: true });
     }
   });
@@ -265,7 +409,7 @@ describe("media and prompt blocks", () => {
   it("falls back to resource_link when image capability is absent", () => {
     const dir = mkdtempSync(join(tmpdir(), "grok-tg-link-"));
     try {
-      const file = writeInboxFile(dir, "shot.png", Buffer.from("fake-png"));
+      const file = writeInboxFile(captureRootIdentity(dir), "shot.png", Buffer.from("fake-png"));
       file.mime = "image/png";
       const { blocks } = buildPromptBlocks({
         text: "inspect",
@@ -274,7 +418,7 @@ describe("media and prompt blocks", () => {
       });
       expect(blocks.some((b) => b.type === "resource_link")).toBe(true);
       expect(blocks.every((b) => b.type !== "image")).toBe(true);
-      cleanupInboxFiles([file.path]);
+      cleanupInboxFiles([file]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

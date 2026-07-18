@@ -28,7 +28,6 @@ import {
   getTypingStartedAt,
   setTypingStartedAt,
   enqueuePrompt,
-  getSessionCwd,
   type HealthSnapshotInput,
 } from "./state.js";
 import { sanitizedError, sanitizePermissionText } from "./redact.js";
@@ -38,8 +37,8 @@ import {
   isAllowedMime,
   writeInboxFile,
   cleanupInboxFiles,
-  readSafeArtifactFile,
   type InboxFile,
+  type RootIdentity,
 } from "./media.js";
 import { basename } from "node:path";
 export interface PromptPayload {
@@ -56,6 +55,7 @@ export interface CancelResult {
 export interface TelegramDeps {
   config: Config;
   canAcceptPrompts?: () => boolean;
+  getSessionRoot: () => RootIdentity;
   onPrompt: (chatId: number, payload: PromptPayload, fromUserId: number) => Promise<void>;
   onCancel: (chatId: number, userId: number, clearQueue: boolean) => Promise<CancelResult>;
   onNewSession: (chatId: number, userId: number) => Promise<boolean>;
@@ -83,9 +83,13 @@ interface QueueItem {
   fn: () => Promise<unknown>;
   resolve: (value: unknown) => void;
   reject: (error: unknown) => void;
+  attempts: number;
 }
 let sendQueue: QueueItem[] = [];
 let sendQueueRunning = false;
+let sendQueueClosing = false;
+let sendQueueDrainPromise: Promise<void> | null = null;
+let inFlightUpdates = 0;
 let typingInterval: NodeJS.Timeout | null = null;
 let typingDebounceTimer: NodeJS.Timeout | null = null;
 let typingMaxTimer: NodeJS.Timeout | null = null;
@@ -96,8 +100,12 @@ const streamDrafts = new Map<number, {
   lastEditAt: number;
   timer: NodeJS.Timeout | null;
   flushing: boolean;
+  generation: number;
 }>();
+let streamGeneration = 0;
+const streamFlushTasks = new Map<number, Set<Promise<void>>>();
 let currentAssistantText = "";
+let assistantTextTruncated = false;
 let bubbleActive = false;
 const bubbleMessageIds = new Map<number, number>();
 const allBubbleIds = new Map<number, Set<number>>();
@@ -379,29 +387,49 @@ async function callApi(
 
 function enqueue(fn: () => Promise<unknown>): Promise<unknown> {
   return new Promise((resolve, reject) => {
-    sendQueue.push({ fn, resolve, reject });
-    if (!sendQueueRunning) drainQueue();
+    if (sendQueueClosing) {
+      reject(new Error("Telegram outbound queue is shutting down"));
+      return;
+    }
+    const config = getRuntimeConfig();
+    if (sendQueue.length + (sendQueueRunning ? 1 : 0) >= config.TELEGRAM_OUTBOUND_QUEUE_MAX) {
+      reject(new Error("Telegram outbound queue is full"));
+      return;
+    }
+    sendQueue.push({ fn, resolve, reject, attempts: 0 });
+    if (!sendQueueRunning) sendQueueDrainPromise = drainQueue();
   });
 }
 async function drainQueue(): Promise<void> {
   sendQueueRunning = true;
-  while (sendQueue.length > 0) {
-    const item = sendQueue.shift();
-    if (!item) continue;
-    try {
-      const r = await item.fn();
-      item.resolve(r);
-    } catch (err: unknown) {
-      if (err instanceof TelegramApiError && err.status === 429) {
-        sendQueue.unshift(item);
-        await sleep((err.retryAfter ?? 5) * 1000);
+  try {
+    while (sendQueue.length > 0) {
+      const item = sendQueue.shift();
+      if (!item) continue;
+      if (sendQueueClosing) {
+        item.reject(new Error("Telegram outbound queue is shutting down"));
         continue;
       }
-      item.reject(err);
+      try {
+        const r = await item.fn();
+        item.resolve(r);
+      } catch (err: unknown) {
+        const config = getRuntimeConfig();
+        if (err instanceof TelegramApiError && err.status === 429
+          && item.attempts < config.TELEGRAM_RETRY_MAX && !sendQueueClosing) {
+          item.attempts += 1;
+          sendQueue.unshift(item);
+          await sleep(Math.min((err.retryAfter ?? 5) * 1000, config.API_TIMEOUT_MS));
+          continue;
+        }
+        item.reject(err);
+      }
+      if (sendQueue.length > 0) await sleep(getRuntimeConfig().SEND_PACE_MS);
     }
-    if (sendQueue.length > 0) await sleep(getRuntimeConfig().SEND_PACE_MS);
+  } finally {
+    sendQueueRunning = false;
+    sendQueueDrainPromise = null;
   }
-  sendQueueRunning = false;
 }
 
 export async function sendMessage(
@@ -526,76 +554,6 @@ export async function deleteMessage(chatId: number, messageId: number): Promise<
     callApi("deleteMessage", { chat_id: chatId, message_id: messageId }, getTelegramToken()));
 }
 
-export async function sendPhoto(chatId: number, filePath: string, caption?: string): Promise<TelegramMessageResult> {
-  const token = getTelegramToken();
-  const timeoutMs = getRuntimeConfig().API_TIMEOUT_MS;
-  const result = await enqueue(async () => {
-    const form = new FormData();
-    form.append("chat_id", String(chatId));
-    if (caption) form.append("caption", caption.slice(0, 1024));
-    const artifact = readSafeArtifactFile(
-      filePath,
-      getSessionCwd(getRuntimeConfig().grokCwdAbs),
-      getRuntimeConfig().MEDIA_MAX_BYTES,
-    );
-    form.append("photo", new Blob([artifact.bytes]), artifact.name);
-    const res = await fetch(`https://api.telegram.org/bot${token}/sendPhoto`, {
-      method: "POST",
-      body: form,
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    if (!res.ok) {
-      throw new TelegramApiError(`Telegram API sendPhoto failed: ${res.status}`, res.status);
-    }
-    const json = parseApiEnvelope(await res.json());
-    if (!json.ok) {
-      throw new TelegramApiError(
-        `Telegram API sendPhoto returned ok=false: ${sanitizedError(json.description ?? "unknown")}`,
-        0,
-      );
-    }
-    return json.result;
-  });
-  return requireMessageResult(result);
-}
-
-export async function sendDocument(
-  chatId: number,
-  filePath: string,
-  caption?: string,
-): Promise<TelegramMessageResult> {
-  const token = getTelegramToken();
-  const timeoutMs = getRuntimeConfig().API_TIMEOUT_MS;
-  const result = await enqueue(async () => {
-    const form = new FormData();
-    form.append("chat_id", String(chatId));
-    if (caption) form.append("caption", caption.slice(0, 1024));
-    const artifact = readSafeArtifactFile(
-      filePath,
-      getSessionCwd(getRuntimeConfig().grokCwdAbs),
-      getRuntimeConfig().MEDIA_MAX_BYTES,
-    );
-    form.append("document", new Blob([artifact.bytes]), artifact.name);
-    const res = await fetch(`https://api.telegram.org/bot${token}/sendDocument`, {
-      method: "POST",
-      body: form,
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    if (!res.ok) {
-      throw new TelegramApiError(`Telegram API sendDocument failed: ${res.status}`, res.status);
-    }
-    const json = parseApiEnvelope(await res.json());
-    if (!json.ok) {
-      throw new TelegramApiError(
-        `Telegram API sendDocument returned ok=false: ${sanitizedError(json.description ?? "unknown")}`,
-        0,
-      );
-    }
-    return json.result;
-  });
-  return requireMessageResult(result);
-}
-
 export function startTyping(chatIds: number[]): void {
   stopTyping();
   const config = getRuntimeConfig();
@@ -639,11 +597,22 @@ export function stopTyping() {
 }
 
 export function resetStreamDraftState() {
+  streamGeneration += 1;
   currentAssistantText = "";
+  assistantTextTruncated = false;
   for (const d of streamDrafts.values()) {
     if (d.timer) clearTimeout(d.timer);
   }
   streamDrafts.clear();
+}
+
+export async function resetAndWaitForStreamDrafts(): Promise<void> {
+  resetStreamDraftState();
+  for (;;) {
+    const tasks = [...streamFlushTasks.values()].flatMap((set) => [...set]);
+    if (!tasks.length) return;
+    await Promise.all(tasks);
+  }
 }
 
 function trimDraftText(text: string, max: number): string {
@@ -652,13 +621,42 @@ function trimDraftText(text: string, max: number): string {
   return `…\n${tail}`;
 }
 
+function trackStreamFlush(
+  generation: number,
+  operation: Promise<void>,
+  label: string,
+): void {
+  let tasks = streamFlushTasks.get(generation);
+  if (!tasks) {
+    tasks = new Set();
+    streamFlushTasks.set(generation, tasks);
+  }
+  const tracked = operation
+    .catch((error: unknown) => {
+      console.error(`[TG] ${label}: ${sanitizedError(error)}`);
+    })
+    .finally(() => {
+      tasks?.delete(tracked);
+      if (tasks?.size === 0) streamFlushTasks.delete(generation);
+    });
+  tasks.add(tracked);
+}
+
 function scheduleStreamDraftFlush(chatIds: number[], force = false, config: Config): void {
   const text = trimDraftText(currentAssistantText, config.STREAM_DRAFT_MAX);
   if (!text) return;
   for (const chatId of chatIds) {
     let draft = streamDrafts.get(chatId);
     if (!draft) {
-      draft = { messageId: null, text: "", lastSentText: "", lastEditAt: 0, timer: null, flushing: false };
+      draft = {
+        messageId: null,
+        text: "",
+        lastSentText: "",
+        lastEditAt: 0,
+        timer: null,
+        flushing: false,
+        generation: streamGeneration,
+      };
       streamDrafts.set(chatId, draft);
     }
     draft.text = text;
@@ -669,27 +667,37 @@ function scheduleStreamDraftFlush(chatIds: number[], force = false, config: Conf
     if (draft.timer) continue;
     const elapsed = Date.now() - draft.lastEditAt;
     const delay = force ? 0 : Math.max(0, config.STREAM_EDIT_INTERVAL_MS - elapsed);
+    const generation = draft.generation;
     draft.timer = setTimeout(() => {
-      void flushStreamDraft(chatId, force, config).catch((error: unknown) => {
-        console.error(`[TG] Stream draft flush failed for chat ${chatId}: ${sanitizedError(error)}`);
-      });
+      trackStreamFlush(
+        generation,
+        flushStreamDraft(chatId, force, config, generation),
+        `Stream draft flush failed for chat ${chatId}`,
+      );
     }, delay);
   }
 }
 
-async function flushStreamDraft(chatId: number, force: boolean, config: Config): Promise<void> {
+async function flushStreamDraft(
+  chatId: number,
+  force: boolean,
+  config: Config,
+  generation: number,
+): Promise<void> {
   const draft = streamDrafts.get(chatId);
-  if (!draft) return;
+  if (!draft || draft.generation !== generation || generation !== streamGeneration) return;
   draft.timer = null;
   if (draft.flushing) {
     if (force) {
       while (draft.flushing) await sleep(10);
-      return flushStreamDraft(chatId, true, config);
+      return flushStreamDraft(chatId, true, config, generation);
     }
     draft.timer = setTimeout(() => {
-      void flushStreamDraft(chatId, false, config).catch((error: unknown) => {
-        console.error(`[TG] Deferred stream flush failed for chat ${chatId}: ${sanitizedError(error)}`);
-      });
+      trackStreamFlush(
+        generation,
+        flushStreamDraft(chatId, false, config, generation),
+        `Deferred stream flush failed for chat ${chatId}`,
+      );
     }, config.STREAM_EDIT_INTERVAL_MS);
     return;
   }
@@ -721,9 +729,11 @@ async function flushStreamDraft(chatId: number, force: boolean, config: Config):
     draft.flushing = false;
     if (draft.text !== draft.lastSentText && streamDrafts.get(chatId) === draft) {
       draft.timer = setTimeout(() => {
-        void flushStreamDraft(chatId, false, config).catch((error: unknown) => {
-          console.error(`[TG] Follow-up stream flush failed for chat ${chatId}: ${sanitizedError(error)}`);
-        });
+        trackStreamFlush(
+          generation,
+          flushStreamDraft(chatId, false, config, generation),
+          `Follow-up stream flush failed for chat ${chatId}`,
+        );
       }, config.STREAM_EDIT_INTERVAL_MS);
     }
   }
@@ -745,6 +755,7 @@ export async function finalizeStreamDrafts(
       lastEditAt: 0,
       timer: null,
       flushing: false,
+      generation: streamGeneration,
     };
     draft.text = finalFirst;
     streamDrafts.set(chatId, draft);
@@ -757,7 +768,7 @@ export async function finalizeStreamDrafts(
         clearTimeout(draft.timer);
         draft.timer = null;
       }
-      await flushStreamDraft(chatId, true, config);
+      await flushStreamDraft(chatId, true, config, draft.generation);
       for (const chunk of chunks.slice(1)) {
         await sendFormattedMessage(chatId, chunk);
       }
@@ -927,6 +938,7 @@ async function getFilePath(fileId: string): Promise<string> {
 
 async function downloadAttachment(
   config: Config,
+  root: RootIdentity,
   fileId: string,
   originalName: string,
   telegramMime?: string | null,
@@ -947,7 +959,7 @@ async function downloadAttachment(
     config.MEDIA_MAX_BYTES,
     config.API_TIMEOUT_MS,
   );
-  const file = writeInboxFile(getSessionCwd(config.grokCwdAbs), name || basename(remotePath), bytes);
+  const file = writeInboxFile(root, name || basename(remotePath), bytes);
   file.mime = mime;
   return file;
 }
@@ -960,6 +972,7 @@ interface MediaExtraction {
 async function extractMediaFromMessage(
   config: Config,
   message: Message,
+  root: RootIdentity,
 ): Promise<MediaExtraction> {
   const files: InboxFile[] = [];
   const errors: string[] = [];
@@ -970,6 +983,7 @@ async function extractMediaFromMessage(
       if (largest?.file_id) {
         files.push(await downloadAttachment(
           config,
+          root,
           largest.file_id,
           "photo.jpg",
           "image/jpeg",
@@ -981,6 +995,7 @@ async function extractMediaFromMessage(
       const doc = message.document;
       files.push(await downloadAttachment(
         config,
+        root,
         doc.file_id,
         doc.file_name || "document",
         doc.mime_type,
@@ -990,6 +1005,7 @@ async function extractMediaFromMessage(
     if (message.voice?.file_id) {
       files.push(await downloadAttachment(
         config,
+        root,
         message.voice.file_id,
         "voice.ogg",
         message.voice.mime_type || "audio/ogg",
@@ -999,6 +1015,7 @@ async function extractMediaFromMessage(
     if (message.audio?.file_id) {
       files.push(await downloadAttachment(
         config,
+        root,
         message.audio.file_id,
         message.audio.file_name || "audio",
         message.audio.mime_type,
@@ -1008,6 +1025,7 @@ async function extractMediaFromMessage(
     if (message.video?.file_id) {
       files.push(await downloadAttachment(
         config,
+        root,
         message.video.file_id,
         message.video.file_name || "video.mp4",
         message.video.mime_type || "video/mp4",
@@ -1059,11 +1077,22 @@ function requireAuthorizedPrivate(
 export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
   telegramToken = config.TELEGRAM_BOT_TOKEN;
   runtimeConfig = config;
+  sendQueueClosing = false;
   const bot = new Bot(telegramToken);
   bot.use(async (_ctx, next) => {
-    deps.onUpdate?.();
-    await next();
+    inFlightUpdates += 1;
+    try {
+      deps.onUpdate?.();
+      await next();
+    } finally {
+      inFlightUpdates -= 1;
+    }
   });
+
+  const mutationsAllowed = () => !deps.canAcceptPrompts || deps.canAcceptPrompts();
+  const rejectUnavailableCommand = async (chatId: number): Promise<void> => {
+    await sendMessage(chatId, "Bridge is temporarily unavailable. Try again shortly.");
+  };
 
   bot.command(["start", "help"], async (ctx) => {
     if (ctx.chat.type !== "private") {
@@ -1106,6 +1135,10 @@ export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
       await sendMessage(ctx.chat.id, "Not authorized.");
       return;
     }
+    if (!mutationsAllowed()) {
+      await rejectUnavailableCommand(auth.chatId);
+      return;
+    }
     const arg = (ctx.match && String(ctx.match).trim().toLowerCase()) || "";
     const clearQueue = arg === "queue" || arg === "all";
     const result = await deps.onCancel(auth.chatId, auth.userId, clearQueue);
@@ -1122,6 +1155,10 @@ export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
       await sendMessage(ctx.chat.id, "Not authorized.");
       return;
     }
+    if (!mutationsAllowed()) {
+      await rejectUnavailableCommand(auth.chatId);
+      return;
+    }
     const reset = await deps.onNewSession(auth.chatId, auth.userId);
     await sendMessage(
       auth.chatId,
@@ -1133,6 +1170,10 @@ export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
     const auth = requireAuthorizedPrivate(ctx, config);
     if (!auth) {
       await sendMessage(ctx.chat.id, "Not authorized.");
+      return;
+    }
+    if (!mutationsAllowed()) {
+      await rejectUnavailableCommand(auth.chatId);
       return;
     }
     const arg = (ctx.match && String(ctx.match).trim().toLowerCase()) || "";
@@ -1149,6 +1190,10 @@ export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
       await sendMessage(ctx.chat.id, "Not authorized.");
       return;
     }
+    if (!mutationsAllowed()) {
+      await rejectUnavailableCommand(auth.chatId);
+      return;
+    }
     const arg = (ctx.match && String(ctx.match).trim().toLowerCase()) || "";
     if (arg !== "on" && arg !== "off") {
       await sendMessage(auth.chatId, "Usage: /verbose on|off");
@@ -1161,6 +1206,10 @@ export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
     const auth = requireAuthorizedPrivate(ctx, config);
     if (!auth) {
       await sendMessage(ctx.chat.id, "Not authorized.");
+      return;
+    }
+    if (!mutationsAllowed()) {
+      await rejectUnavailableCommand(auth.chatId);
       return;
     }
     const arg = (ctx.match && String(ctx.match).trim()) || "";
@@ -1177,6 +1226,10 @@ export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
     const userIdStr = String(ctx.from?.id || "");
     if (!isAllowed(access, userIdStr) || ctx.chat?.type !== "private") {
       await answerCallbackQuery(ctx.callbackQuery.id, "Not authorized", true);
+      return;
+    }
+    if (!mutationsAllowed()) {
+      await answerCallbackQuery(ctx.callbackQuery.id, "Bridge temporarily unavailable", true);
       return;
     }
 
@@ -1290,6 +1343,44 @@ export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
 
     const text = message.text || message.caption || "";
     const access = reloadAccess(config);
+    const allowed = isAllowed(access, userId);
+
+    if (!allowed && access.allowedUsers.length > 0) {
+      await sendMessage(chatId, "Pairing is closed. This bridge already has an owner.");
+      return;
+    }
+    if (!allowed) {
+      if (deps.canAcceptPrompts && !deps.canAcceptPrompts()) {
+        await sendMessage(chatId, "Bridge is temporarily unavailable. Try again shortly.");
+        return;
+      }
+      cleanExpiredPending(config, access);
+      const pending = access.pending?.[String(chatId)];
+      if (pending) {
+        if (completePairing(config, access, chatId, userId, text.trim())) {
+          await sendMessage(chatId, "Paired! You can now send prompts to Grok Build.");
+          return;
+        }
+        const remaining = Math.max(0, 5 - (pending.attempts ?? 0));
+        await sendMessage(chatId, remaining > 0
+          ? `Invalid pairing code. ${remaining} attempt${remaining === 1 ? "" : "s"} remaining.`
+          : "Pairing cancelled after too many invalid attempts. Send another message to request a new code.");
+        return;
+      }
+      const code = startPairing(config, access, chatId);
+      const expiryMinutes = Math.max(1, Math.round(config.PAIRING_EXPIRY_MS / 60_000));
+      await sendMessage(
+        chatId,
+        `Pairing required. Ask the bridge operator for the one-time code, then send it here. It expires in about ${expiryMinutes} minute${expiryMinutes === 1 ? "" : "s"}.`,
+      );
+      console.log(`[PAIRING] User ${userId} chat ${chatId} code: ${code}`);
+      return;
+    }
+
+    if (deps.canAcceptPrompts && !deps.canAcceptPrompts()) {
+      await sendMessage(chatId, "Bridge is temporarily unavailable. Try again shortly.");
+      return;
+    }
 
     // permission text fallback
     const pp = getPendingPermission();
@@ -1341,39 +1432,6 @@ export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
       }
     }
 
-    if (!isAllowed(access, userId) && access.allowedUsers.length > 0) {
-      await sendMessage(chatId, "Pairing is closed. This bridge already has an owner.");
-      return;
-    }
-    if (!isAllowed(access, userId)) {
-      cleanExpiredPending(config, access);
-      const pending = access.pending?.[String(chatId)];
-      if (pending) {
-        if (completePairing(config, access, chatId, userId, text.trim())) {
-          await sendMessage(chatId, "Paired! You can now send prompts to Grok Build.");
-          return;
-        }
-        const remaining = Math.max(0, 5 - (pending.attempts ?? 0));
-        await sendMessage(chatId, remaining > 0
-          ? `Invalid pairing code. ${remaining} attempt${remaining === 1 ? "" : "s"} remaining.`
-          : "Pairing cancelled after too many invalid attempts. Send another message to request a new code.");
-        return;
-      }
-      const code = startPairing(config, access, chatId);
-      const expiryMinutes = Math.max(1, Math.round(config.PAIRING_EXPIRY_MS / 60_000));
-      await sendMessage(
-        chatId,
-        `Pairing required. Ask the bridge operator for the one-time code, then send it here. It expires in about ${expiryMinutes} minute${expiryMinutes === 1 ? "" : "s"}.`,
-      );
-      console.log(`[PAIRING] User ${userId} chat ${chatId} code: ${code}`);
-      return;
-    }
-
-    if (deps.canAcceptPrompts && !deps.canAcceptPrompts()) {
-      await sendMessage(chatId, "Bridge is shutting down. Try again after it restarts.");
-      return;
-    }
-
     if (getActivePrompt() && messageHasMedia(message)) {
       await sendMessage(
         chatId,
@@ -1383,10 +1441,14 @@ export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
     }
 
     // Authorized prompt path — download media first
-    const media = await extractMediaFromMessage(config, message);
+    const media = await extractMediaFromMessage(config, message, deps.getSessionRoot());
     if (media.errors.length) {
       await sendMessage(chatId, `Could not process attachment: ${media.errors[0]}`);
-      cleanupInboxFiles(media.files.map((f) => f.path));
+      cleanupInboxFiles(media.files);
+      return;
+    }
+    if (deps.canAcceptPrompts && !deps.canAcceptPrompts()) {
+      cleanupInboxFiles(media.files);
       return;
     }
 
@@ -1407,7 +1469,7 @@ export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
 
     if (getActivePrompt()) {
       if (media.files.length > 0) {
-        cleanupInboxFiles(media.files.map((file) => file.path));
+        cleanupInboxFiles(media.files);
         await sendMessage(
           chatId,
           "Media follow-ups are not queued. Wait for the active prompt or use /cancel first.",
@@ -1416,7 +1478,7 @@ export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
       }
       if (config.PROMPT_QUEUE_MAX <= 0) {
         await sendMessage(chatId, "Grok is still working on the previous prompt. Use /cancel or wait.");
-        cleanupInboxFiles(media.files.map((f) => f.path));
+        cleanupInboxFiles(media.files);
         return;
       }
       const queued = enqueuePrompt({
@@ -1432,7 +1494,7 @@ export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
           chatId,
           `Queue full (${config.PROMPT_QUEUE_MAX}). Use /cancel or wait.`,
         );
-        cleanupInboxFiles(media.files.map((f) => f.path));
+        cleanupInboxFiles(media.files);
         return;
       }
       await sendMessage(
@@ -1452,19 +1514,23 @@ export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
     resetStreamDraftState();
     startTyping([chatId]);
     bubbleActive = true;
-    startActivePrompt(
+    const activePrompt = startActivePrompt(
       chatId,
       message.message_id || 0,
       userId,
-      payload.inboxFiles.map((f) => f.path),
+      payload.inboxFiles,
     );
 
     void deps.onPrompt(chatId, payload, userId).catch(async (error: unknown) => {
       console.error(`[TG] Prompt handler failed: ${sanitizedError(error)}`);
-      clearActivePrompt();
-      stopTyping();
-      resetStreamDraftState();
-      cleanupInboxFiles(payload.inboxFiles.map((f) => f.path));
+      const ownsPrompt = getActivePrompt()?.id === activePrompt.id;
+      if (ownsPrompt) {
+        clearActivePrompt();
+        stopTyping();
+        resetStreamDraftState();
+      }
+      cleanupInboxFiles(payload.inboxFiles);
+      if (!ownsPrompt) return;
       try {
         await sendMessage(
           chatId,
@@ -1480,11 +1546,49 @@ export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
 }
 
 export async function stopPolling(bot: Bot): Promise<void> {
+  let stopError: unknown = null;
+  let stopTimer: NodeJS.Timeout | null = null;
   try {
-    await bot.stop();
+    const stopResult = await Promise.race([
+      bot.stop().then(() => true),
+      new Promise<boolean>((resolve) => {
+        stopTimer = setTimeout(() => resolve(false), getRuntimeConfig().API_TIMEOUT_MS);
+        stopTimer.unref();
+      }),
+    ]);
+    if (!stopResult) throw new Error("Telegram polling stop timed out");
   } catch (error: unknown) {
+    stopError = error;
     console.warn(`[TG] Failed to stop polling cleanly: ${sanitizedError(error)}`);
+  } finally {
+    if (stopTimer) clearTimeout(stopTimer);
   }
+  const deadline = Date.now() + getRuntimeConfig().API_TIMEOUT_MS;
+  while (inFlightUpdates > 0 && Date.now() < deadline) await sleep(25);
+  if (inFlightUpdates > 0) {
+    const handlerError = new Error(`Telegram handlers did not settle (${inFlightUpdates} still active)`);
+    throw stopError
+      ? new AggregateError([stopError, handlerError], "Telegram polling did not stop safely")
+      : handlerError;
+  }
+  if (stopError) throw stopError;
+}
+
+export function beginOutboundShutdown(): void {
+  sendQueueClosing = true;
+  const queued = sendQueue.splice(0);
+  for (const item of queued) item.reject(new Error("Telegram outbound queue is shutting down"));
+}
+
+export async function closeOutboundQueue(): Promise<void> {
+  beginOutboundShutdown();
+  const drain = sendQueueDrainPromise;
+  if (!drain) return;
+  const drained = await Promise.race([
+    drain.then(() => true),
+    sleep(getRuntimeConfig().API_TIMEOUT_MS + 1_000).then(() => false),
+  ]);
+  if (!drained) throw new Error("Telegram outbound queue did not drain during shutdown");
 }
 
 export function healthStatusLines(extra: HealthSnapshotInput): string[] {
@@ -1519,7 +1623,17 @@ export function getCurrentAssistantText() {
   return currentAssistantText;
 }
 export function appendAssistantDelta(delta: string) {
-  currentAssistantText += delta;
+  if (assistantTextTruncated) return;
+  const max = getRuntimeConfig().ASSISTANT_TEXT_MAX_CHARS;
+  if (currentAssistantText.length + delta.length <= max) {
+    currentAssistantText += delta;
+    return;
+  }
+  const marker = "\n\n[Response truncated by bridge]";
+  const suffix = marker.slice(0, max);
+  const prefixBudget = Math.max(0, max - suffix.length);
+  currentAssistantText = (currentAssistantText + delta).slice(0, prefixBudget) + suffix;
+  assistantTextTruncated = true;
 }
 export function scheduleAssistantDeltaFlush(chatIds: number[], config: Config) {
   scheduleStreamDraftFlush(chatIds, false, config);
@@ -1532,8 +1646,12 @@ export function getStreamDrafts() {
 export function resetTelegramRuntimeForTests() {
   stopTyping();
   resetStreamDraftState();
+  for (const item of sendQueue) item.reject(new Error("Telegram test runtime reset"));
   sendQueue = [];
   sendQueueRunning = false;
+  sendQueueClosing = false;
+  sendQueueDrainPromise = null;
+  inFlightUpdates = 0;
   telegramToken = null;
   runtimeConfig = null;
   bubbleActive = false;
@@ -1547,4 +1665,5 @@ export function resetTelegramRuntimeForTests() {
 export function setTelegramRuntimeForTests(token: string, config: Config): void {
   telegramToken = token;
   runtimeConfig = config;
+  sendQueueClosing = false;
 }

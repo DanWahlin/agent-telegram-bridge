@@ -9,6 +9,7 @@ import {
 import {
   getPendingPermission,
   setPendingPermission,
+  cancelPendingPermissionState,
 } from "./state.js";
 import { createTestConfig } from "./test-support.js";
 
@@ -18,7 +19,48 @@ describe("permission timeout handling", () => {
     vi.useRealTimers();
   });
 
-  it("marks the card expired before cancelling the ACP request", async () => {
+  it("registers permission state before card delivery and cancels a late card", async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), "grok-tg-permission-race-"));
+    try {
+      const config = createTestConfig(stateDir);
+      const request: PermissionRequest = {
+        sessionId: "session-1",
+        connectionGeneration: 1,
+        promptEpoch: 1,
+        toolCall: { toolCallId: "tool-1", kind: "edit", title: "Edit file" },
+        options: [{ optionId: "once", name: "Allow once", kind: "allow_once" }],
+      };
+      let finishDelivery!: (messages: Array<{ chatId: number; messageId: number }>) => void;
+      const delivery = new Promise<Array<{ chatId: number; messageId: number }>>((resolve) => {
+        finishDelivery = resolve;
+      });
+      const resolve = vi.fn();
+      const expire = vi.fn(async () => undefined);
+
+      const forwarding = handlePermissionForward(
+        config,
+        request,
+        vi.fn(async () => delivery),
+        resolve,
+        expire,
+      );
+      await Promise.resolve();
+      expect(getPendingPermission()).not.toBeNull();
+
+      cancelPendingPermissionState();
+      finishDelivery([{ chatId: 42, messageId: 9 }]);
+      await forwarding;
+
+      expect(resolve).toHaveBeenCalledTimes(1);
+      expect(resolve).toHaveBeenCalledWith({ outcome: { outcome: "cancelled" } });
+      expect(expire).toHaveBeenCalledWith("Edit file", [{ chatId: 42, messageId: 9 }]);
+      expect(getPendingPermission()).toBeNull();
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("cancels the ACP request before slow card expiry cleanup", async () => {
     vi.useFakeTimers();
     const stateDir = mkdtempSync(join(tmpdir(), "grok-tg-permission-timeout-"));
     try {
@@ -27,6 +69,8 @@ describe("permission timeout handling", () => {
       });
       const request: PermissionRequest = {
         sessionId: "session-1",
+        connectionGeneration: 1,
+        promptEpoch: 1,
         toolCall: {
           toolCallId: "tool-1",
           kind: "edit",
@@ -57,7 +101,7 @@ describe("permission timeout handling", () => {
       );
       expect(resolve).toHaveBeenCalledWith({ outcome: { outcome: "cancelled" } });
       expect(getPendingPermission()).toBeNull();
-      expect(expire.mock.invocationCallOrder[0]).toBeLessThan(resolve.mock.invocationCallOrder[0] ?? 0);
+      expect(resolve.mock.invocationCallOrder[0]).toBeLessThan(expire.mock.invocationCallOrder[0] ?? 0);
     } finally {
       rmSync(stateDir, { recursive: true, force: true });
     }

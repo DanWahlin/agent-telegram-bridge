@@ -1,20 +1,19 @@
 import {
   mkdirSync,
   writeFileSync,
-  readFileSync,
-  rmSync,
-  existsSync,
-  realpathSync,
+  readSync,
   lstatSync,
-  chmodSync,
   statSync,
+  realpathSync,
   openSync,
   closeSync,
   fstatSync,
-  constants as fsConstants,
-  readdirSync,
+  fchmodSync,
+  ftruncateSync,
+  constants,
 } from "node:fs";
-import { basename, extname, isAbsolute, join, resolve, relative } from "node:path";
+import { basename, extname, join, resolve } from "node:path";
+import { createHash } from "node:crypto";
 import type { ContentBlock } from "@agentclientprotocol/sdk";
 import { sanitizedError } from "./redact.js";
 import { messageSafeRandom } from "./utils.js";
@@ -27,15 +26,43 @@ export interface PromptCapabilities {
 
 export interface InboxFile {
   path: string;
+  name: string;
   mime: string;
   originalName: string;
   size: number;
+  rootPath: string;
+  rootDev: bigint;
+  rootIno: bigint;
+  inboxDev: bigint;
+  inboxIno: bigint;
+  fileDev: bigint;
+  fileIno: bigint;
+  sha256: string;
+  descriptorFd: number | null;
 }
 
-export interface MediaArtifact {
+export interface RootIdentity {
   path: string;
-  mime: string;
-  kind: "photo" | "document";
+  dev: bigint;
+  ino: bigint;
+}
+
+export function captureRootIdentity(cwd: string): RootIdentity {
+  const path = realpathSync(resolve(cwd));
+  const stat = statSync(path, { bigint: true });
+  if (!stat.isDirectory() || lstatSync(path, { bigint: true }).isSymbolicLink()) {
+    throw new Error("Session CWD must be a real directory");
+  }
+  return { path, dev: stat.dev, ino: stat.ino };
+}
+
+export function validateRootIdentity(root: RootIdentity): void {
+  const current = lstatSync(root.path, { bigint: true });
+  if (current.isSymbolicLink() || !current.isDirectory()
+    || current.dev !== root.dev || current.ino !== root.ino
+    || realpathSync(root.path) !== root.path) {
+    throw new Error("Session CWD identity changed");
+  }
 }
 
 const EXT_MIME: Record<string, string> = {
@@ -63,8 +90,6 @@ const EXT_MIME: Record<string, string> = {
   ".html": "text/html",
   ".css": "text/css",
 };
-
-const PHOTO_EXTS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"]);
 
 const DEFAULT_MIME_ALLOW = [
   "image/png",
@@ -133,32 +158,74 @@ export function isAllowedMime(mime: string, allowlist: string[]): boolean {
   return allowlist.includes(`${type}/*`);
 }
 
-export function inboxDir(cwd: string): string {
-  return join(resolve(cwd), ".tg-inbox");
+export function inboxDir(root: RootIdentity): string {
+  validateRootIdentity(root);
+  return join(root.path, ".tg-inbox");
 }
 
-export function ensureInboxDir(cwd: string): string {
-  const dir = inboxDir(cwd);
+interface InboxDirectoryHandle {
+  fd: number;
+  dir: string;
+  descriptorPath: string;
+  dev: bigint;
+  ino: bigint;
+}
+
+function openInboxDirectory(root: RootIdentity): InboxDirectoryHandle {
+  validateRootIdentity(root);
+  const dir = join(root.path, ".tg-inbox");
   mkdirSync(dir, { recursive: true, mode: 0o700 });
-  if (lstatSync(dir).isSymbolicLink()) {
-    throw new Error("Inbox directory may not be a symlink");
+  const fd = openSync(
+    dir,
+    constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+  );
+  try {
+    const opened = fstatSync(fd, { bigint: true });
+    const current = lstatSync(dir, { bigint: true });
+    if (!opened.isDirectory() || current.isSymbolicLink() || !current.isDirectory()
+      || opened.dev !== current.dev || opened.ino !== current.ino) {
+      throw new Error("Inbox directory identity changed");
+    }
+    fchmodSync(fd, 0o700);
+    const descriptorPath = `/proc/self/fd/${fd}`;
+    if (realpathSync(descriptorPath) !== dir) {
+      throw new Error("Inbox directory is not bound to the authorized CWD");
+    }
+    validateRootIdentity(root);
+    return { fd, dir, descriptorPath, dev: opened.dev, ino: opened.ino };
+  } catch (error: unknown) {
+    closeSync(fd);
+    throw error;
   }
-  chmodSync(dir, 0o700);
-  writeFileSync(join(dir, ".gitignore"), "*\n", { mode: 0o600 });
-  return dir;
 }
 
-export function cleanupStaleInbox(cwd: string): void {
-  const dir = ensureInboxDir(cwd);
-  for (const entry of readdirSync(dir)) {
-    if (entry === ".gitignore") continue;
-    const path = join(dir, entry);
-    try {
-      const stat = lstatSync(path);
-      if (stat.isFile() || stat.isSymbolicLink()) rmSync(path, { force: true });
-    } catch {
-      // Best-effort crash recovery; active prompts track their own files.
+function writeInboxGitignore(handle: InboxDirectoryHandle): void {
+  const path = join(handle.descriptorPath, ".gitignore");
+  const fd = openSync(
+    path,
+    constants.O_WRONLY | constants.O_CREAT | constants.O_NOFOLLOW,
+    0o600,
+  );
+  try {
+    const opened = fstatSync(fd, { bigint: true });
+    if (!opened.isFile() || opened.nlink !== 1n) {
+      throw new Error("Inbox .gitignore must be a singly linked regular file");
     }
+    ftruncateSync(fd, 0);
+    writeFileSync(fd, "*\n");
+    fchmodSync(fd, 0o600);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+export function ensureInboxDir(root: RootIdentity): string {
+  const handle = openInboxDirectory(root);
+  try {
+    writeInboxGitignore(handle);
+    return handle.dir;
+  } finally {
+    closeSync(handle.fd);
   }
 }
 
@@ -168,145 +235,34 @@ export function safeInboxFileName(originalName: string): string {
   return `${messageSafeRandom().slice(0, 10)}_${safe}`;
 }
 
-/**
- * Resolve a candidate path that must stay under cwd (after realpath).
- * Returns absolute real path or null if outside/unsafe.
- */
-export function resolveSafePath(candidate: string, cwd: string): string | null {
+function readInboxFile(file: InboxFile): Buffer {
+  const root: RootIdentity = { path: file.rootPath, dev: file.rootDev, ino: file.rootIno };
+  const handle = openInboxDirectory(root);
   try {
-    const root = realpathSync(resolve(cwd));
-    const abs = isAbsolute(candidate) ? resolve(candidate) : resolve(root, candidate);
-    if (!existsSync(abs)) return null;
-    if (lstatSync(abs).isSymbolicLink()) {
-      // Allow reading through symlink only if the target stays under root
+    if (handle.dev !== file.inboxDev || handle.ino !== file.inboxIno) {
+      throw new Error("Inbox directory identity changed after admission");
     }
-    const real = realpathSync(abs);
-    const rel = relative(root, real);
-    if (rel.startsWith("..") || isAbsolute(rel)) return null;
-    if (!lstatSync(real).isFile()) return null;
-    return real;
-  } catch {
-    return null;
-  }
-}
-
-const SENSITIVE_ARTIFACT_NAMES = new Set([
-  "credentials",
-  "credentials.json",
-  "access.json",
-  "lock.json",
-  "health.json",
-]);
-const SENSITIVE_ARTIFACT_EXTENSIONS = new Set([
-  ".key",
-  ".pem",
-  ".p12",
-  ".pfx",
-  ".kdbx",
-]);
-
-/**
- * Revalidate an outbound artifact at send time and reject hidden or credential-like paths.
- */
-export function resolveSafeArtifactPath(candidate: string, cwd: string): string | null {
-  const safe = resolveSafePath(candidate, cwd);
-  if (!safe) return null;
-  const root = realpathSync(resolve(cwd));
-  const rel = relative(root, safe);
-  const parts = rel.split(/[\\/]+/).filter(Boolean);
-  if (parts.some((part) => part.startsWith("."))) return null;
-  const name = basename(safe).toLowerCase();
-  if (name === ".env" || name.startsWith(".env.")) return null;
-  if (SENSITIVE_ARTIFACT_NAMES.has(name)) return null;
-  if (SENSITIVE_ARTIFACT_EXTENSIONS.has(extname(name))) return null;
-  return safe;
-}
-
-export function artifactFitsLimit(path: string, maxBytes: number): boolean {
-  try {
-    const stat = statSync(path);
-    return stat.isFile() && stat.size <= maxBytes;
-  } catch {
-    return false;
-  }
-}
-
-export function readSafeArtifactFile(
-  candidate: string,
-  cwd: string,
-  maxBytes: number,
-): { bytes: Buffer; name: string; path: string } {
-  const safe = resolveSafeArtifactPath(candidate, cwd);
-  if (!safe) throw new Error("Artifact path is outside the active CWD or is sensitive");
-  const flags = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0);
-  const fd = openSync(safe, flags);
-  try {
-    const stat = fstatSync(fd);
-    if (!stat.isFile()) throw new Error("Artifact is not a regular file");
-    if (stat.size > maxBytes) {
-      throw new Error(`Artifact too large (${stat.size} bytes; max ${maxBytes})`);
+    const fd = file.descriptorFd;
+    if (fd === null) throw new Error("Inbox file descriptor is no longer available");
+    const opened = fstatSync(fd, { bigint: true });
+    if (!opened.isFile() || opened.dev !== file.fileDev || opened.ino !== file.fileIno
+      || opened.size !== BigInt(file.size)) {
+      throw new Error("Inbox file identity changed after admission");
     }
-    const root = realpathSync(resolve(cwd));
-    let openedPath = safe;
-    try {
-      openedPath = realpathSync(`/proc/self/fd/${fd}`);
-    } catch {
-      openedPath = realpathSync(safe);
+    const data = Buffer.alloc(file.size);
+    let offset = 0;
+    while (offset < data.length) {
+      const count = readSync(fd, data, offset, data.length - offset, offset);
+      if (count === 0) throw new Error("Inbox file ended before its admitted size");
+      offset += count;
     }
-    if (openedPath !== root && !openedPath.startsWith(root + "/")) {
-      throw new Error("Artifact changed outside the active CWD before upload");
+    if (createHash("sha256").update(data).digest("hex") !== file.sha256) {
+      throw new Error("Inbox file content changed after admission");
     }
-    return { bytes: readFileSync(fd), name: basename(safe), path: openedPath };
+    return data;
   } finally {
-    closeSync(fd);
+    closeSync(handle.fd);
   }
-}
-
-const PATH_IN_TEXT =
-  /(?:^|[\s`"'(=])((?:\/[^\s`"')\]]+)|(?:\.\.?\/[^\s`"')\]]+)|(?:[A-Za-z0-9_.\-]+\/[^\s`"')\]]+\.[A-Za-z0-9]+))/g;
-
-export function extractMediaPaths(text: string, cwd: string): string[] {
-  const found = new Set<string>();
-  if (!text) return [];
-  for (const match of text.matchAll(PATH_IN_TEXT)) {
-    const raw = match[1];
-    if (!raw) continue;
-    // Strip trailing punctuation
-    const cleaned = raw.replace(/[.,;:!?]+$/, "");
-    const safe = resolveSafePath(cleaned, cwd);
-    if (safe) found.add(safe);
-  }
-  return [...found];
-}
-
-export function extractPathsFromUnknown(value: unknown, cwd: string, depth = 0): string[] {
-  if (depth > 6 || value == null) return [];
-  if (typeof value === "string") return extractMediaPaths(value, cwd);
-  if (Array.isArray(value)) {
-    return value.flatMap((item) => extractPathsFromUnknown(item, cwd, depth + 1));
-  }
-  if (typeof value === "object") {
-    const record = value as Record<string, unknown>;
-    const paths: string[] = [];
-    for (const key of ["path", "file", "filePath", "filepath", "output", "url", "uri", "saved", "image", "result"]) {
-      if (key in record) paths.push(...extractPathsFromUnknown(record[key], cwd, depth + 1));
-    }
-    return [...new Set(paths)];
-  }
-  return [];
-}
-
-export function classifyArtifact(path: string, mime?: string): MediaArtifact | null {
-  const guessed = mime || guessMime(path);
-  const ext = extname(path).toLowerCase();
-  if (isImageMime(guessed) || PHOTO_EXTS.has(ext)) {
-    return { path, mime: guessed, kind: "photo" };
-  }
-  // Documents and other files
-  if (existsSync(path)) {
-    return { path, mime: guessed, kind: "document" };
-  }
-  return null;
 }
 
 export function buildPromptBlocks(options: {
@@ -322,29 +278,33 @@ export function buildPromptBlocks(options: {
   blocks.push({ type: "text", text });
 
   for (const file of options.files) {
-    const buf = readFileSync(file.path);
+    const buf = readInboxFile(file);
+    const descriptorPath = file.descriptorFd === null
+      ? null
+      : `/proc/${process.pid}/fd/${file.descriptorFd}`;
+    if (!descriptorPath) throw new Error("Inbox file descriptor is no longer available");
     const b64 = buf.toString("base64");
     if (isImageMime(file.mime) && options.capabilities.image) {
       blocks.push({
         type: "image",
         data: b64,
         mimeType: file.mime,
-        uri: `file://${file.path}`,
+        uri: `file://${descriptorPath}`,
       });
-      notes.push(`Attached image: ${file.originalName} (${file.path})`);
+      notes.push(`Attached image: ${file.originalName} (${descriptorPath})`);
     } else if (isAudioMime(file.mime) && options.capabilities.audio) {
       blocks.push({
         type: "audio",
         data: b64,
         mimeType: file.mime,
       });
-      notes.push(`Attached audio: ${file.originalName} (${file.path})`);
+      notes.push(`Attached audio: ${file.originalName} (${descriptorPath})`);
     } else if (options.capabilities.embeddedContext) {
       if (file.mime.startsWith("text/") || file.mime === "application/json") {
         blocks.push({
           type: "resource",
           resource: {
-            uri: `file://${file.path}`,
+            uri: `file://${descriptorPath}`,
             mimeType: file.mime,
             text: buf.toString("utf8").slice(0, 200_000),
           },
@@ -353,24 +313,24 @@ export function buildPromptBlocks(options: {
         blocks.push({
           type: "resource",
           resource: {
-            uri: `file://${file.path}`,
+            uri: `file://${descriptorPath}`,
             mimeType: file.mime,
             blob: b64,
           },
         });
       }
-      notes.push(`Embedded resource: ${file.originalName} (${file.path})`);
+      notes.push(`Embedded resource: ${file.originalName} (${descriptorPath})`);
     } else {
       // Baseline: resource_link + path in text so agent can open via tools
       blocks.push({
         type: "resource_link",
         name: file.originalName,
-        uri: `file://${file.path}`,
+        uri: `file://${descriptorPath}`,
         mimeType: file.mime,
         size: file.size,
-        description: `Telegram attachment saved at ${file.path}`,
+        description: `Telegram attachment saved at ${descriptorPath}`,
       });
-      notes.push(`Attachment saved for tools: ${file.path}`);
+      notes.push(`Attachment saved for tools: ${descriptorPath}`);
     }
   }
 
@@ -385,33 +345,95 @@ export function buildPromptBlocks(options: {
   return { blocks, notes };
 }
 
-export function cleanupInboxFiles(paths: string[]): void {
-  for (const path of paths) {
+export function cleanupInboxFiles(files: InboxFile[]): void {
+  for (const file of files) {
+    const descriptorFd = file.descriptorFd;
+    file.descriptorFd = null;
+    if (descriptorFd === null) continue;
     try {
-      rmSync(path, { force: true });
+      const opened = fstatSync(descriptorFd, { bigint: true });
+      if (!opened.isFile() || opened.dev !== file.fileDev || opened.ino !== file.fileIno) {
+        throw new Error("Inbox file descriptor identity changed before cleanup");
+      }
+      // Node does not expose unlinkat(AT_EMPTY_PATH). Erase the admitted opened
+      // object instead of unlinking a reusable pathname that can be swapped.
+      ftruncateSync(descriptorFd, 0);
+      fchmodSync(descriptorFd, 0o000);
     } catch (error: unknown) {
-      console.warn(`[MEDIA] Failed to remove inbox file: ${sanitizedError(error)}`);
+      console.warn(`[MEDIA] Failed to retire inbox file: ${sanitizedError(error)}`);
+    } finally {
+      try {
+        closeSync(descriptorFd);
+      } catch (error: unknown) {
+        if ((error as NodeJS.ErrnoException).code !== "EBADF") {
+          console.warn(`[MEDIA] Failed to close inbox file descriptor: ${sanitizedError(error)}`);
+        }
+      }
     }
   }
 }
 
 export function writeInboxFile(
-  cwd: string,
+  root: RootIdentity,
   originalName: string,
   data: Buffer,
 ): InboxFile {
-  const dir = ensureInboxDir(cwd);
+  const handle = openInboxDirectory(root);
   const name = safeInboxFileName(originalName);
-  const path = join(dir, name);
-  writeFileSync(path, data, { mode: 0o600, flag: "wx" });
-  chmodSync(path, 0o600);
-  const mime = guessMime(originalName);
-  return {
-    path,
-    mime,
-    originalName: basename(originalName || name),
-    size: data.length,
-  };
+  const descriptorPath = join(handle.descriptorPath, name);
+  const path = join(handle.dir, name);
+  let fd: number | null = null;
+  let retained = false;
+  try {
+    writeInboxGitignore(handle);
+    fd = openSync(
+      descriptorPath,
+      constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o600,
+    );
+    writeFileSync(fd, data);
+    fchmodSync(fd, 0o600);
+    const opened = fstatSync(fd, { bigint: true });
+    if (!opened.isFile() || opened.size !== BigInt(data.length)) {
+      throw new Error("Inbox file write did not produce the expected regular file");
+    }
+    validateRootIdentity(root);
+    const mime = guessMime(originalName);
+    const result: InboxFile = {
+      path,
+      name,
+      mime,
+      originalName: basename(originalName || name),
+      size: data.length,
+      rootPath: root.path,
+      rootDev: root.dev,
+      rootIno: root.ino,
+      inboxDev: handle.dev,
+      inboxIno: handle.ino,
+      fileDev: opened.dev,
+      fileIno: opened.ino,
+      sha256: createHash("sha256").update(data).digest("hex"),
+      descriptorFd: fd,
+    };
+    retained = true;
+    return result;
+  } catch (error: unknown) {
+    if (fd !== null) {
+      try {
+        const opened = fstatSync(fd, { bigint: true });
+        if (opened.isFile()) {
+          ftruncateSync(fd, 0);
+          fchmodSync(fd, 0o000);
+        }
+      } catch {
+        // The descriptor is still closed below; never unlink a reusable pathname.
+      }
+    }
+    throw error;
+  } finally {
+    if (fd !== null && !retained) closeSync(fd);
+    closeSync(handle.fd);
+  }
 }
 
 export function formatPlanText(

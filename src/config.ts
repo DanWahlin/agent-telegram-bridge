@@ -18,6 +18,7 @@ const EnvSchema = z.object({
     .transform((v) => v === "true" || v === "1" || v === "yes"),
   // Timing controls (ms)
   PAIRING_EXPIRY_MS: z.coerce.number().int().positive().default(5 * 60 * 1000),
+  PAIRING_PENDING_MAX: z.coerce.number().int().positive().max(1000).default(100),
   PERMISSION_TIMEOUT_MS: z.coerce.number().int().positive().default(5 * 60 * 1000),
   LOCK_STALE_AFTER_MS: z.coerce.number().int().positive().default((30 + 60 + 45) * 1000),
   PROMPT_STALE_AFTER_MS: z.coerce.number().int().positive().default(15 * 60 * 1000),
@@ -31,6 +32,9 @@ const EnvSchema = z.object({
   PROGRESS_NOTICE_ITERATION_MS: z.coerce.number().int().positive().default(60 * 1000),
   PROGRESS_NOTICE_MAX_ITERATIONS: z.coerce.number().int().positive().default(90),
   SEND_PACE_MS: z.coerce.number().int().nonnegative().default(50),
+  TELEGRAM_OUTBOUND_QUEUE_MAX: z.coerce.number().int().positive().max(1000).default(100),
+  TELEGRAM_RETRY_MAX: z.coerce.number().int().nonnegative().max(20).default(5),
+  ASSISTANT_TEXT_MAX_CHARS: z.coerce.number().int().positive().max(1_000_000).default(200_000),
   TYPING_INTERVAL_MS: z.coerce.number().int().positive().default(4000),
   TYPING_DEBOUNCE_MS: z.coerce.number().int().positive().default(60000),
   HEALTH_WRITE_MIN_INTERVAL_MS: z.coerce.number().int().positive().default(5000),

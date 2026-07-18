@@ -12,6 +12,7 @@ import { hostname, platform } from "node:os";
 import { z, type ZodType } from "zod";
 import type { PermissionOption, RequestPermissionResponse } from "@agentclientprotocol/sdk";
 import type { Config } from "./config.js";
+import type { InboxFile } from "./media.js";
 import { nowIso, parseTimeMs, ageMs, messageSafeRandom } from "./utils.js";
 import { sanitizedError, sanitizePermissionText } from "./redact.js";
 
@@ -188,6 +189,14 @@ export function startPairing(config: Config, access: AccessState, chatId: number
   const chatIdStr = String(chatId);
   const code = messageSafeRandom().slice(0, 6).toUpperCase();
   if (!access.pending) access.pending = {};
+  if (!(chatIdStr in access.pending)) {
+    const entries = Object.entries(access.pending)
+      .sort(([, a], [, b]) => a.timestamp - b.timestamp);
+    while (entries.length >= config.PAIRING_PENDING_MAX) {
+      const oldest = entries.shift();
+      if (oldest) delete access.pending[oldest[0]];
+    }
+  }
   access.pending[chatIdStr] = { code, timestamp: Date.now(), attempts: 0 };
   saveAccess(config, access);
   return code;
@@ -360,7 +369,7 @@ export interface ActivePromptState {
   toolCount: number;
   cancelling: boolean;
   staleMessageId: number | null;
-  inboxFiles: string[];
+  inboxFiles: InboxFile[];
 }
 
 export interface QueuedPromptState {
@@ -370,15 +379,14 @@ export interface QueuedPromptState {
   messageId: number;
   text: string;
   replyContext: string | null;
-  /** Serialized inbox file metadata after download */
-  inboxFiles: Array<{ path: string; mime: string; originalName: string; size: number }>;
+  /** In-memory descriptor identity captured after download. */
+  inboxFiles: InboxFile[];
   enqueuedAt: string;
 }
 
 export interface LastFinalResponse {
   chatId: number;
   text: string;
-  artifactPaths: string[];
   savedAt: number;
 }
 
@@ -390,6 +398,8 @@ export interface PendingPermissionState {
   timer: NodeJS.Timeout;
   resolve: (outcome: RequestPermissionResponse) => void;
   messages: Array<{ chatId: number; messageId: number }>;
+  connectionGeneration: number;
+  promptEpoch: number;
   rawRequest?: { options: PermissionOption[] };
 }
 
@@ -420,8 +430,15 @@ export function takePendingPermission(id?: string): PendingPermissionState | nul
   pendingPermission = null;
   return current;
 }
-export function cancelPendingPermissionState(): PendingPermissionState | null {
-  const pending = takePendingPermission();
+export function cancelPendingPermissionState(
+  connectionGeneration?: number,
+  promptEpoch?: number,
+): PendingPermissionState | null {
+  const current = getPendingPermission();
+  if (!current
+    || (connectionGeneration !== undefined && current.connectionGeneration !== connectionGeneration)
+    || (promptEpoch !== undefined && current.promptEpoch !== promptEpoch)) return null;
+  const pending = takePendingPermission(current.id);
   if (!pending) return null;
   clearTimeout(pending.timer);
   pending.resolve({ outcome: { outcome: "cancelled" } });
@@ -441,7 +458,7 @@ export function startActivePrompt(
   chatId: number,
   messageId: number,
   userId = chatId,
-  inboxFiles: string[] = [],
+  inboxFiles: InboxFile[] = [],
 ): ActivePromptState {
   const startedAt = nowIso();
   activePrompt = {

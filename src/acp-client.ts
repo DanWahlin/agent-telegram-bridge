@@ -1,5 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { Readable, Writable } from "node:stream";
+import { statSync } from "node:fs";
+import { platform } from "node:os";
 import * as acp from "@agentclientprotocol/sdk";
 import type {
   ContentBlock,
@@ -14,24 +16,29 @@ import { messageSafeRandom, nowIso, sleep } from "./utils.js";
 import { sanitizedError, sanitizePermissionText } from "./redact.js";
 import {
   takePendingPermission,
+  cancelPendingPermissionState,
+  getPendingPermission,
   setPendingPermission,
   updateActivePromptActivity,
   writeHealthSnapshot,
   getSessionCwd,
   type PendingPermissionState,
 } from "./state.js";
-import type { PromptCapabilities } from "./media.js";
+import type { PromptCapabilities, RootIdentity } from "./media.js";
 
 export interface PermissionRequest {
   sessionId: string;
   toolCall: ToolCallUpdate;
   options: PermissionOption[];
+  connectionGeneration: number;
+  promptEpoch: number;
 }
 
 interface AcpHandlers {
   onSessionUpdate: (update: SessionUpdate) => void;
   onPermissionRequest: (request: PermissionRequest) => Promise<RequestPermissionResponse>;
   onEvent: (kind: string) => void;
+  getExpectedRootIdentity: () => RootIdentity;
 }
 
 export interface AcpClientHandle {
@@ -64,7 +71,75 @@ export function buildGrokChildEnv(parentEnv: NodeJS.ProcessEnv): NodeJS.ProcessE
   return childEnv;
 }
 
-export function createAcpClient(config: Config, handlers: AcpHandlers): AcpClientHandle {
+export function verifyProcessCwdIdentity(
+  pid: number | undefined,
+  expected: RootIdentity,
+): void {
+  if (platform() !== "linux") {
+    throw new Error("Secure ACP child CWD verification requires Linux /proc");
+  }
+  if (!pid) throw new Error("ACP child PID is unavailable");
+  const actual = statSync(`/proc/${pid}/cwd`, { bigint: true });
+  if (!actual.isDirectory() || actual.dev !== expected.dev || actual.ino !== expected.ino) {
+    throw new Error("ACP child started outside the authorized CWD identity");
+  }
+}
+
+async function exitsWithin(exited: Promise<void>, timeoutMs: number): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    const timer = setTimeout(() => resolve(false), timeoutMs);
+    exited.then(
+      () => {
+        clearTimeout(timer);
+        resolve(true);
+      },
+      () => {
+        clearTimeout(timer);
+        resolve(false);
+      },
+    );
+  });
+}
+
+export function childExitBarrier(child: ChildProcess): Promise<void> {
+  return new Promise<void>((resolve) => {
+    child.once("exit", () => resolve());
+  });
+}
+
+export async function terminateChildProcess(
+  running: Pick<ChildProcess, "kill">,
+  exited: Promise<void>,
+  graceMs = 3_000,
+  killWaitMs = 3_000,
+): Promise<void> {
+  try {
+    running.kill("SIGTERM");
+  } catch (error: unknown) {
+    console.warn(`[ACP] Failed to terminate Grok process: ${sanitizedError(error)}`);
+  }
+  let provenExited = await exitsWithin(exited, graceMs);
+  if (!provenExited) {
+    try {
+      running.kill("SIGKILL");
+    } catch (error: unknown) {
+      console.warn(`[ACP] Failed to kill unresponsive Grok process: ${sanitizedError(error)}`);
+    }
+    provenExited = await exitsWithin(exited, killWaitMs);
+  }
+  if (!provenExited) throw new Error("ACP child process did not exit after SIGKILL");
+}
+
+export interface AcpRuntimeHooks {
+  beforeSpawn?: () => Promise<void>;
+  spawn?: typeof spawn;
+}
+
+export function createAcpClient(
+  config: Config,
+  handlers: AcpHandlers,
+  runtime: AcpRuntimeHooks = {},
+): AcpClientHandle {
   let child: ChildProcess | null = null;
   let childExit: Promise<void> | null = null;
   let connection: acp.ClientConnection | null = null;
@@ -72,80 +147,170 @@ export function createAcpClient(config: Config, handlers: AcpHandlers): AcpClien
   let session: acp.ActiveSession | null = null;
   let sessionId: string | null = null;
   let connected = false;
-  let promptRunning = false;
+  let generation = 0;
+  let promptEpoch = 0;
+  let activePromptGeneration: number | null = null;
+  let activePromptEpoch: number | null = null;
   let promptCapabilities: PromptCapabilities = {};
   let sessionCwd = getSessionCwd(config.grokCwdAbs);
+  let lifecycleEpoch = 0;
+  let lifecycleTail: Promise<void> = Promise.resolve();
+
+  function serializeLifecycle<T>(operation: () => Promise<T>): Promise<T> {
+    const run = lifecycleTail.then(operation);
+    lifecycleTail = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  async function withSetupTimeout<T>(operation: Promise<T>, label: string): Promise<T> {
+    let timer: NodeJS.Timeout | null = null;
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label} timed out`)), config.API_TIMEOUT_MS);
+      timer.unref();
+    });
+    try {
+      return await Promise.race([operation, timeout]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
 
   async function stopChild(): Promise<void> {
     const running = child;
     const exited = childExit;
-    child = null;
-    childExit = null;
     if (!running) return;
-    try {
-      running.kill("SIGTERM");
-    } catch (error: unknown) {
-      console.warn(`[ACP] Failed to terminate Grok process: ${sanitizedError(error)}`);
+    if (!exited) throw new Error("ACP child exit monitor is unavailable");
+
+    if (running.pid) {
+      await terminateChildProcess(running, exited);
+    } else {
+      await exited;
     }
-    if (exited) {
-      const graceful = await Promise.race([exited.then(() => true), sleep(3000).then(() => false)]);
-      if (!graceful) {
-        try {
-          running.kill("SIGKILL");
-        } catch (error: unknown) {
-          console.warn(`[ACP] Failed to kill unresponsive Grok process: ${sanitizedError(error)}`);
-        }
-        await Promise.race([exited, sleep(1000)]);
-      }
-    }
+    if (child === running) child = null;
+    if (childExit === exited) childExit = null;
   }
 
-  async function connect(): Promise<void> {
+  async function connectUnlocked(expectedLifecycleEpoch: number): Promise<void> {
+    if (expectedLifecycleEpoch !== lifecycleEpoch) {
+      throw new Error("ACP connection attempt was superseded by shutdown");
+    }
     if (connected && session && context) return;
-    await shutdown();
+    await shutdownUnlocked();
+    if (expectedLifecycleEpoch !== lifecycleEpoch) {
+      throw new Error("ACP connection attempt was superseded by shutdown");
+    }
+    if (activePromptGeneration !== null) {
+      throw new Error("Previous ACP prompt task has not settled");
+    }
 
     const args = ["agent", "--model", config.GROK_MODEL];
     if (config.GROK_ALWAYS_APPROVE) args.push("--always-approve");
     args.push("stdio");
 
     const childEnv = buildGrokChildEnv(process.env);
-    child = spawn(config.grokBin, args, {
+    const expectedRoot = handlers.getExpectedRootIdentity();
+    if (expectedRoot.path !== sessionCwd) {
+      throw new Error("ACP CWD path does not match its authorized root identity");
+    }
+    await runtime.beforeSpawn?.();
+    if (expectedLifecycleEpoch !== lifecycleEpoch) {
+      throw new Error("ACP connection attempt was superseded by shutdown");
+    }
+    const spawned = (runtime.spawn ?? spawn)(config.grokBin, args, {
       cwd: sessionCwd,
       stdio: ["pipe", "pipe", "pipe"],
       env: childEnv,
       shell: false,
     });
-    childExit = new Promise<void>((resolve) => child!.once("exit", () => resolve()));
-    child.stderr?.on("data", (chunk: Buffer) => {
+    const connectionGeneration = ++generation;
+    child = spawned;
+    const exited = childExitBarrier(spawned);
+    const spawnReady = new Promise<void>((resolve, reject) => {
+      spawned.once("spawn", () => resolve());
+      spawned.once("error", reject);
+    });
+    childExit = exited;
+    spawned.on("error", (error: Error) => {
+      handlers.onEvent(`process.error:${sanitizedError(error, 200)}`);
+    });
+    spawned.stderr?.on("data", (chunk: Buffer) => {
       const line = sanitizePermissionText(chunk.toString("utf8"), 1000);
       if (line) console.error(`[GROK] ${line}`);
     });
-    child.once("exit", (code, signal) => {
-      connected = false;
-      session = null;
-      context = null;
-      sessionId = null;
+    spawned.once("exit", (code, signal) => {
+      if (child === spawned && generation === connectionGeneration) {
+        connected = false;
+        session = null;
+        context = null;
+        sessionId = null;
+        connection = null;
+      }
       handlers.onEvent(`process.exit:${code ?? signal ?? "unknown"}`);
     });
 
-    const stream = acp.ndJsonStream(
-      Writable.toWeb(child.stdin!),
-      Readable.toWeb(child.stdout!),
+    try {
+      await spawnReady;
+      if (expectedLifecycleEpoch !== lifecycleEpoch) {
+        throw new Error("ACP connection attempt was superseded by shutdown");
+      }
+      verifyProcessCwdIdentity(spawned.pid, expectedRoot);
+    } catch (error: unknown) {
+      if (spawned.pid) {
+        await stopChild();
+      } else if (child === spawned) {
+        child = null;
+        childExit = null;
+        generation += 1;
+      }
+      throw error;
+    }
+
+    let setupConnection: acp.ClientConnection | null = null;
+    try {
+      const stream = acp.ndJsonStream(
+      Writable.toWeb(spawned.stdin!),
+      Readable.toWeb(spawned.stdout!),
     );
     const app = acp
       .client({ name: "grok-build-telegram" })
-      .onRequest(acp.methods.client.session.requestPermission, ({ params }) => {
+      .onRequest(acp.methods.client.session.requestPermission, async ({ params }) => {
         handlers.onEvent("permission.request");
-        return handlers.onPermissionRequest(params);
+        const requestPromptEpoch = activePromptEpoch;
+        if (generation !== connectionGeneration
+          || activePromptGeneration !== connectionGeneration
+          || requestPromptEpoch === null) {
+          return { outcome: { outcome: "cancelled" } };
+        }
+        const response = await handlers.onPermissionRequest({
+          ...params,
+          connectionGeneration,
+          promptEpoch: requestPromptEpoch,
+        });
+        if (generation !== connectionGeneration
+          || activePromptGeneration !== connectionGeneration
+          || activePromptEpoch !== requestPromptEpoch) {
+          cancelPendingPermissionState(connectionGeneration, requestPromptEpoch);
+          return { outcome: { outcome: "cancelled" } };
+        }
+        return response;
       });
 
-    connection = app.connect(stream);
-    context = connection.agent;
-    const initialized = await context.request(acp.methods.agent.initialize, {
-      protocolVersion: acp.PROTOCOL_VERSION,
-      clientCapabilities: {},
-      clientInfo: { name: "grok-build-telegram", version: "0.1.0" },
-    });
+    const nextConnection = app.connect(stream);
+    setupConnection = nextConnection;
+    const nextContext = nextConnection.agent;
+    if (!nextContext) throw new Error("ACP agent connection unavailable");
+    const initialized = await withSetupTimeout(
+      nextContext.request(acp.methods.agent.initialize, {
+        protocolVersion: acp.PROTOCOL_VERSION,
+        clientCapabilities: {},
+        clientInfo: { name: "grok-build-telegram", version: "0.1.0" },
+      }),
+      "ACP initialize",
+    );
+    if (child !== spawned || generation !== connectionGeneration
+      || expectedLifecycleEpoch !== lifecycleEpoch) {
+      throw new Error("ACP connection attempt was superseded during initialization");
+    }
     if (initialized.protocolVersion !== acp.PROTOCOL_VERSION) {
       throw new Error(`Unsupported ACP protocol ${initialized.protocolVersion}`);
     }
@@ -155,8 +320,20 @@ export function createAcpClient(config: Config, handlers: AcpHandlers): AcpClien
       audio: caps?.audio === true,
       embeddedContext: caps?.embeddedContext === true,
     };
-    session = await context.buildSession(sessionCwd).start();
-    sessionId = session.sessionId;
+    const nextSession = await withSetupTimeout(
+      nextContext.buildSession(sessionCwd).start(),
+      "ACP session start",
+    );
+    if (child !== spawned || generation !== connectionGeneration
+      || expectedLifecycleEpoch !== lifecycleEpoch) {
+      nextSession.dispose();
+      nextConnection.close();
+      throw new Error("ACP process exited during connection setup");
+    }
+    connection = nextConnection;
+    context = nextContext;
+    session = nextSession;
+    sessionId = nextSession.sessionId;
     connected = true;
     console.log(
       `[ACP] Grok session ${sessionId} connected with model ${config.GROK_MODEL} cwd=${sessionCwd} caps=${JSON.stringify(promptCapabilities)}`,
@@ -165,21 +342,39 @@ export function createAcpClient(config: Config, handlers: AcpHandlers): AcpClien
       connected: true,
       acpSessionId: sessionId,
     }, { force: true });
+    } catch (error: unknown) {
+      try {
+        setupConnection?.close();
+      } catch (closeError: unknown) {
+        console.warn(`[ACP] Failed to close incomplete connection: ${sanitizedError(closeError)}`);
+      }
+      connected = false;
+      connection = null;
+      context = null;
+      session = null;
+      sessionId = null;
+      await stopChild();
+      throw error;
+    }
   }
 
   async function sendPrompt(
     prompt: string | ContentBlock | ContentBlock[],
   ): Promise<PromptResponse> {
     await connect();
-    if (!session || promptRunning) {
-      throw new Error(promptRunning ? "A prompt is already active" : "No ACP session");
+    const promptSession = session;
+    const promptGeneration = generation;
+    if (!promptSession || activePromptGeneration !== null) {
+      throw new Error(activePromptGeneration !== null ? "A prompt is already active" : "No ACP session");
     }
-    promptRunning = true;
+    const currentPromptEpoch = ++promptEpoch;
+    activePromptGeneration = promptGeneration;
+    activePromptEpoch = currentPromptEpoch;
     try {
       handlers.onEvent("prompt.sent");
-      const completion = session.prompt(prompt);
+      const completion = promptSession.prompt(prompt);
       for (;;) {
-        const message = await session.nextUpdate();
+        const message = await promptSession.nextUpdate();
         if (message.kind === "stop") {
           handlers.onEvent(`prompt.stop:${message.stopReason}`);
           break;
@@ -191,44 +386,72 @@ export function createAcpClient(config: Config, handlers: AcpHandlers): AcpClien
       }
       return await completion;
     } finally {
-      promptRunning = false;
+      if (activePromptGeneration === promptGeneration) activePromptGeneration = null;
+      if (activePromptEpoch === currentPromptEpoch) activePromptEpoch = null;
     }
   }
 
   async function cancelCurrent(): Promise<void> {
-    if (!context || !sessionId || !promptRunning) return;
-    await context.notify(acp.methods.agent.session.cancel, { sessionId });
+    const currentContext = context;
+    const currentSessionId = sessionId;
+    if (!currentContext || !currentSessionId || activePromptGeneration === null) return;
+    await withSetupTimeout(
+      currentContext.notify(acp.methods.agent.session.cancel, { sessionId: currentSessionId }),
+      "ACP cancel",
+    );
     handlers.onEvent("prompt.cancelled");
   }
 
   async function waitForIdle(timeoutMs: number): Promise<boolean> {
     const deadline = Date.now() + timeoutMs;
-    while (promptRunning && Date.now() < deadline) {
+    while (activePromptGeneration !== null && Date.now() < deadline) {
       await sleep(100);
     }
-    return !promptRunning;
+    return activePromptGeneration === null;
   }
 
-  async function shutdown(): Promise<void> {
+  async function shutdownUnlocked(): Promise<void> {
     connected = false;
-    promptRunning = false;
-    try {
-      session?.dispose();
-    } catch (error: unknown) {
-      console.warn(`[ACP] Failed to dispose session: ${sanitizedError(error)}`);
-    }
+    const closingSession = session;
+    const closingConnection = connection;
     session = null;
     sessionId = null;
     context = null;
-    connection?.close();
     connection = null;
+    generation += 1;
+    try {
+      closingSession?.dispose();
+    } catch (error: unknown) {
+      console.warn(`[ACP] Failed to dispose session: ${sanitizedError(error)}`);
+    }
+    try {
+      closingConnection?.close();
+    } catch (error: unknown) {
+      console.warn(`[ACP] Failed to close connection: ${sanitizedError(error)}`);
+    }
     await stopChild();
   }
 
-  async function restart(): Promise<void> {
-    await shutdown();
-    await sleep(200);
-    await connect();
+  function connect(): Promise<void> {
+    const expectedLifecycleEpoch = lifecycleEpoch;
+    return serializeLifecycle(() => connectUnlocked(expectedLifecycleEpoch));
+  }
+
+  function shutdown(): Promise<void> {
+    lifecycleEpoch += 1;
+    return serializeLifecycle(shutdownUnlocked);
+  }
+
+  function restart(): Promise<void> {
+    const expectedLifecycleEpoch = ++lifecycleEpoch;
+    return serializeLifecycle(async () => {
+      await shutdownUnlocked();
+      if (activePromptGeneration !== null) {
+        throw new Error("Cannot restart ACP before the active prompt task settles");
+      }
+      await sleep(200);
+      await connectUnlocked(expectedLifecycleEpoch);
+    });
   }
 
   return {
@@ -240,7 +463,7 @@ export function createAcpClient(config: Config, handlers: AcpHandlers): AcpClien
     restart,
     getSessionId: () => sessionId,
     isConnected: () => connected,
-    isPromptRunning: () => promptRunning,
+    isPromptRunning: () => activePromptGeneration !== null,
     getPromptCapabilities: () => promptCapabilities,
     setCwd: (cwd: string) => {
       sessionCwd = cwd;
@@ -269,22 +492,27 @@ export async function handlePermissionForward(
     config.PERMISSION_SUMMARY_MAX,
   );
   const id = messageSafeRandom();
-  const messages = await sendPermissionCard(summary, id, request.options);
+  if (getPendingPermission()) {
+    resolve({ outcome: { outcome: "cancelled" } });
+    throw new Error("A permission request is already pending");
+  }
 
+  let resolved = false;
+  const finish = (outcome: RequestPermissionResponse) => {
+    if (resolved) return;
+    resolved = true;
+    resolve(outcome);
+  };
   const timer = setTimeout(() => {
     const current = takePendingPermission(id);
     if (!current) return;
-    void (async () => {
-      if (expirePermissionCards) {
-        try {
-          await expirePermissionCards(current.summary, current.messages);
-        } catch (error: unknown) {
-          console.warn(`[TG] Permission expiry cleanup failed: ${sanitizedError(error)}`);
-        }
-      }
-      writeHealthSnapshot(config, "permission-timeout", { connected: true }, { force: true });
-      current.resolve({ outcome: { outcome: "cancelled" } });
-    })();
+    current.resolve({ outcome: { outcome: "cancelled" } });
+    writeHealthSnapshot(config, "permission-timeout", { connected: true }, { force: true });
+    if (expirePermissionCards) {
+      void expirePermissionCards(current.summary, current.messages).catch((error: unknown) => {
+        console.warn(`[TG] Permission expiry cleanup failed: ${sanitizedError(error)}`);
+      });
+    }
   }, config.PERMISSION_TIMEOUT_MS);
   timer.unref();
 
@@ -296,14 +524,33 @@ export async function handlePermissionForward(
     timer,
     resolve: (outcome) => {
       clearTimeout(timer);
-      setPendingPermission(null);
-      resolve(outcome);
+      takePendingPermission(id);
+      finish(outcome);
     },
-    messages,
+    messages: [],
+    connectionGeneration: request.connectionGeneration,
+    promptEpoch: request.promptEpoch,
     rawRequest: request,
   };
   setPendingPermission(pending);
-  writeHealthSnapshot(config, "permission-requested", {
+  writeHealthSnapshot(config, "permission-registering", {
     connected: true,
   }, { force: true });
+
+  try {
+    const messages = await sendPermissionCard(summary, id, request.options);
+    const current = getPendingPermission();
+    if (!current || current.id !== id) {
+      if (expirePermissionCards) await expirePermissionCards(summary, messages);
+      return;
+    }
+    current.messages.push(...messages);
+    writeHealthSnapshot(config, "permission-requested", {
+      connected: true,
+    }, { force: true });
+  } catch (error: unknown) {
+    const current = takePendingPermission(id);
+    if (current) current.resolve({ outcome: { outcome: "cancelled" } });
+    throw error;
+  }
 }

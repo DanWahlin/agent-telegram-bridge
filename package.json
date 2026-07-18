@@ -10,7 +10,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json && chmod +x dist/src/index.js",
-    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.test.json",
     "lint": "eslint \"src/**/*.ts\" \"scripts/**/*.ts\"",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -38,6 +38,7 @@
   },
   "files": [
     "dist",
+    ".env.example",
     "images/logo.webp",
     "AGENTS.md",
     "README.md",

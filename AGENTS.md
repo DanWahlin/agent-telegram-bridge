@@ -18,7 +18,7 @@ This project is a security-sensitive bridge between one private Telegram owner a
 | `src/config.ts` | Environment parsing and runtime configuration |
 | `src/redact.ts` | Sanitization for logs and permission text |
 | `src/utils.ts` | Small shared time and random-value helpers |
-| `src/media.ts` | Attachment MIME/path helpers, inbox files, ACP content blocks, artifact path extraction |
+| `src/media.ts` | Attachment MIME/root helpers, inbox files, and ACP content blocks |
 | `src/*.test.ts` | Unit, integration, runtime, and security regression tests |
 | `scripts/smoke-acp.ts` | Live ACP smoke test without Telegram |
 
@@ -35,8 +35,8 @@ This project is a security-sensitive bridge between one private Telegram owner a
 - Sanitize errors before logging or sending them to Telegram.
 - Do not silently swallow failures in required delivery or permission paths. Cleanup may be best effort, but failures should be safely logged.
 - Keep automatic tool approval disabled by default.
-- Media ingress: owner + private chat before download; MIME allowlist + size cap; inbox under session CWD with owner-only perms; delete after prompt.
-- Media egress: only real files under the session CWD (realpath, no traversal); never send paths outside the allowlisted root.
+- Media ingress: owner + private chat before download; MIME allowlist + size cap; inbox under session CWD with owner-only perms; after the prompt, erase and permission-lock the exact admitted opened file before closing its descriptor. Do not unlink a reusable pathname during live cleanup; empty placeholders may remain until offline maintenance.
+- Keep automatic outbound local-file delivery disabled until ACP exposes a narrow, typed artifact contract.
 - Serialize ACP prompts (one in flight). Telegram-side queue is allowed; do not open a second ACP prompt concurrently.
 - `/cwd` may only switch to paths in the configured allowlist.
 

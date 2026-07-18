@@ -41,9 +41,9 @@ import {
 import {
   createTelegramBot,
   stopPolling,
+  beginOutboundShutdown,
+  closeOutboundQueue,
   sendMessage,
-  sendPhoto,
-  sendDocument,
   editPermissionMessage,
   editMessageReplyMarkup,
   editFormattedMessage,
@@ -53,6 +53,7 @@ import {
   permissionKeyboard,
   resolvedPermissionText,
   resetStreamDraftState,
+  resetAndWaitForStreamDrafts,
   finalizeStreamDrafts,
   stopTyping,
   startTyping,
@@ -66,6 +67,7 @@ import {
   getToolsSeenCount,
   stalePromptKeyboard,
   type PromptPayload,
+  type TelegramDeps,
 } from "./telegram.js";
 import {
   createAcpClient,
@@ -84,13 +86,12 @@ import { sanitizedError, sanitizePermissionText } from "./redact.js";
 import {
   buildPromptBlocks,
   cleanupInboxFiles,
-  cleanupStaleInbox,
-  classifyArtifact,
-  artifactFitsLimit,
-  extractPathsFromUnknown,
+  ensureInboxDir,
+  captureRootIdentity,
+  validateRootIdentity,
   formatPlanText,
   formatPlanUpdateText,
-  resolveSafeArtifactPath,
+  type RootIdentity,
 } from "./media.js";
 import { Bot } from "grammy";
 import { resolve } from "node:path";
@@ -101,7 +102,13 @@ export interface Bridge {
   shutdown: () => Promise<void>;
 }
 
-export function createBridge(config: Config): Bridge {
+export interface BridgeFactories {
+  createAcpClient?: typeof createAcpClient;
+  createTelegramBot?: (config: Config, deps: TelegramDeps) => Bot;
+  stopPolling?: typeof stopPolling;
+}
+
+export function createBridge(config: Config, factories: BridgeFactories = {}): Bridge {
   ensureStateDir(config);
   let botInstance: Bot | null = null;
   let acpHandle: AcpClientHandle | null = null;
@@ -118,23 +125,30 @@ export function createBridge(config: Config): Bridge {
   let shutdownPromise: Promise<void> | null = null;
   let drainingQueue = false;
   let queuePaused = false;
+  let lifecycleCompromised = false;
   let shuttingDown = false;
   let promptTask: Promise<void> | null = null;
-  const collectedArtifacts = new Set<string>();
+  const promptUiTasks = new Map<string, Set<Promise<void>>>();
+  const closingPromptUiIds = new Set<string>();
+  const allowedRootIdentities = new Map(
+    config.cwdAllowlist.map((path) => [path, captureRootIdentity(path)] as const),
+  );
+  let sessionRoot: RootIdentity = allowedRootIdentities.get(config.grokCwdAbs)
+    ?? captureRootIdentity(config.grokCwdAbs);
+  let acpExpectedRoot: RootIdentity = sessionRoot;
+  const sessionIdForLock = `tg-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  acquireLock(config, sessionIdForLock);
 
-  setSessionCwd(config.grokCwdAbs);
+  setSessionCwd(sessionRoot.path);
   try {
-    cleanupStaleInbox(config.grokCwdAbs);
+    ensureInboxDir(sessionRoot);
   } catch (error: unknown) {
-    console.warn(`[MEDIA] Could not initialize inbox cleanup: ${sanitizedError(error)}`);
+    console.warn(`[MEDIA] Could not initialize inbox: ${sanitizedError(error)}`);
   }
   setVerboseMode(config.VERBOSE_DEFAULT);
 
   const access = reloadAccess(config);
   saveAccess(config, access);
-
-  const sessionIdForLock = `tg-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  acquireLock(config, sessionIdForLock);
 
   function updateLastPoll() {
     lastPollAt = nowIso();
@@ -169,39 +183,6 @@ export function createBridge(config: Config): Bridge {
 
   function cwd(): string {
     return acpHandle?.getCwd() ?? getSessionCwd(config.grokCwdAbs);
-  }
-
-  function rememberArtifacts(paths: string[]): void {
-    for (const path of paths) {
-      const safePath = resolveSafeArtifactPath(path, cwd());
-      if (!safePath || !artifactFitsLimit(safePath, config.MEDIA_MAX_BYTES)) continue;
-      const artifact = classifyArtifact(safePath);
-      if (artifact) collectedArtifacts.add(artifact.path);
-    }
-  }
-
-  async function deliverArtifacts(chatId: number, paths: string[]): Promise<string[]> {
-    const delivered: string[] = [];
-    const seen = new Set<string>();
-    for (const path of paths) {
-      if (seen.has(path)) continue;
-      seen.add(path);
-      const safePath = resolveSafeArtifactPath(path, cwd());
-      if (!safePath || !artifactFitsLimit(safePath, config.MEDIA_MAX_BYTES)) continue;
-      const artifact = classifyArtifact(safePath);
-      if (!artifact) continue;
-      try {
-        if (artifact.kind === "photo") {
-          await sendPhoto(chatId, artifact.path);
-        } else {
-          await sendDocument(chatId, artifact.path);
-        }
-        delivered.push(artifact.path);
-      } catch (error: unknown) {
-        console.warn(`[TG] Failed to deliver artifact ${path}: ${sanitizedError(error)}`);
-      }
-    }
-    return delivered;
   }
 
   async function sendPermissionCard(
@@ -240,6 +221,8 @@ export function createBridge(config: Config): Bridge {
     const pp = takePendingPermission();
     if (!pp) return false;
     clearTimeout(pp.timer);
+    pp.resolve(decision);
+    writeHealthSnapshot(config, "permission-resolved", buildExtra(), { force: true });
     for (const m of pp.messages) {
       try {
         await editPermissionMessage(
@@ -257,8 +240,6 @@ export function createBridge(config: Config): Bridge {
         }
       }
     }
-    pp.resolve(decision);
-    writeHealthSnapshot(config, "permission-resolved", buildExtra(), { force: true });
     return true;
   }
 
@@ -303,7 +284,33 @@ export function createBridge(config: Config): Bridge {
     }
   }
 
-  async function upsertPlanMessage(chatId: number, text: string): Promise<void> {
+  function trackPromptUiTask(promptId: string, operation: Promise<void>): void {
+    let tasks = promptUiTasks.get(promptId);
+    if (!tasks) {
+      tasks = new Set();
+      promptUiTasks.set(promptId, tasks);
+    }
+    const tracked = operation
+      .catch((error: unknown) => {
+        console.warn(`[TG] Prompt UI task failed: ${sanitizedError(error)}`);
+      })
+      .finally(() => {
+        tasks?.delete(tracked);
+        if (tasks?.size === 0) promptUiTasks.delete(promptId);
+      });
+    tasks.add(tracked);
+  }
+
+  async function waitForPromptUiTasks(promptId: string): Promise<void> {
+    for (;;) {
+      const tasks = promptUiTasks.get(promptId);
+      if (!tasks?.size) return;
+      await Promise.all([...tasks]);
+    }
+  }
+
+  async function upsertPlanMessage(chatId: number, text: string, promptId: string): Promise<void> {
+    if (getActivePrompt()?.id !== promptId) return;
     const existing = getPlanMessageId(chatId);
     if (existing) {
       try {
@@ -313,19 +320,20 @@ export function createBridge(config: Config): Bridge {
         if (!(error instanceof Error && /message to edit not found/i.test(error.message))) {
           console.warn(`[TG] Plan edit failed: ${sanitizedError(error)}`);
         }
-        setPlanMessageId(chatId, null);
+        if (getActivePrompt()?.id === promptId) setPlanMessageId(chatId, null);
       }
     }
+    if (getActivePrompt()?.id !== promptId) return;
     try {
       const sent = await sendFormattedMessage(chatId, text);
-      setPlanMessageId(chatId, sent.message_id);
+      if (getActivePrompt()?.id === promptId) setPlanMessageId(chatId, sent.message_id);
     } catch (error: unknown) {
       console.warn(`[TG] Plan send failed: ${sanitizedError(error)}`);
     }
   }
 
-  async function updateThoughtStream(chatId: number, delta: string): Promise<void> {
-    if (!getVerboseMode()) return;
+  async function updateThoughtStream(chatId: number, delta: string, promptId: string): Promise<void> {
+    if (!getVerboseMode() || getActivePrompt()?.id !== promptId) return;
     let draft = getThoughtDraft(chatId);
     if (!draft) draft = { messageId: null, text: "", lastEditAt: 0 };
     draft.text = (draft.text + delta).slice(-3500);
@@ -340,8 +348,10 @@ export function createBridge(config: Config): Bridge {
         await editFormattedMessage(chatId, draft.messageId, body);
       } else {
         const sent = await sendFormattedMessage(chatId, body);
+        if (getActivePrompt()?.id !== promptId) return;
         draft.messageId = sent.message_id;
       }
+      if (getActivePrompt()?.id !== promptId) return;
       draft.lastEditAt = now;
       setThoughtDraft(chatId, draft);
     } catch (error: unknown) {
@@ -349,15 +359,15 @@ export function createBridge(config: Config): Bridge {
     }
   }
 
-  const acpClient = createAcpClient(config, {
+  const acpClient = (factories.createAcpClient ?? createAcpClient)(config, {
     onSessionUpdate: (upd: SessionUpdate) => {
       const kind = upd.sessionUpdate;
       recordAcp(kind);
 
       const active = getActivePrompt();
-      const chats = active ? [active.chatId] : [];
-      if (!chats.length) return;
-      const chatId = chats[0]!;
+      if (!active || closingPromptUiIds.has(active.id)) return;
+      const chats = [active.chatId];
+      const chatId = active.chatId;
 
       switch (upd.sessionUpdate) {
         case "agent_message_chunk":
@@ -368,7 +378,7 @@ export function createBridge(config: Config): Bridge {
           break;
         case "agent_thought_chunk":
           if (upd.content.type === "text") {
-            void updateThoughtStream(chatId, upd.content.text);
+            trackPromptUiTask(active.id, updateThoughtStream(chatId, upd.content.text, active.id));
           }
           break;
         case "tool_call":
@@ -377,13 +387,9 @@ export function createBridge(config: Config): Bridge {
           break;
         case "tool_call_update":
           updateToolCall(upd.toolCallId, upd.status);
-          if (upd.status === "completed") {
-            rememberArtifacts(extractPathsFromUnknown(upd.rawOutput, cwd()));
-            rememberArtifacts(extractPathsFromUnknown(upd.content, cwd()));
-          }
           break;
         case "plan":
-          void upsertPlanMessage(chatId, formatPlanText(upd.entries ?? []));
+          trackPromptUiTask(active.id, upsertPlanMessage(chatId, formatPlanText(upd.entries ?? []), active.id));
           break;
         case "plan_update": {
           const plan = upd.plan as {
@@ -392,12 +398,12 @@ export function createBridge(config: Config): Bridge {
             content?: string;
             planId?: string;
           };
-          void upsertPlanMessage(chatId, formatPlanUpdateText(plan));
+          trackPromptUiTask(active.id, upsertPlanMessage(chatId, formatPlanUpdateText(plan), active.id));
           break;
         }
         case "plan_removed":
           setPlanMessageId(chatId, null);
-          void sendMessage(chatId, "📋 Plan cleared.").catch(() => undefined);
+          trackPromptUiTask(active.id, sendMessage(chatId, "📋 Plan cleared.").then(() => undefined));
           break;
         case "current_mode_update":
           setCurrentModeId(upd.currentModeId);
@@ -440,17 +446,46 @@ export function createBridge(config: Config): Bridge {
       });
     },
     onEvent: (k: string) => recordAcp(k),
+    getExpectedRootIdentity: () => acpExpectedRoot,
   });
   acpHandle = acpClient;
 
-  async function runPromptPayload(chatId: number, payload: PromptPayload): Promise<void> {
+  async function shutdownAcpOwnership(): Promise<void> {
+    try {
+      await acpClient.shutdown();
+    } catch (error: unknown) {
+      lifecycleCompromised = true;
+      queuePaused = true;
+      throw error;
+    }
+  }
+
+  function requireLifecycleOpen(operation: string): void {
+    if (shuttingDown || lifecycleCompromised) {
+      throw new Error(`${operation} refused while the bridge is shutting down`);
+    }
+  }
+
+  async function connectAuthorizedRoot(): Promise<void> {
+    requireLifecycleOpen("ACP connect");
+    validateRootIdentity(sessionRoot);
+    try {
+      await acpClient.connect();
+      requireLifecycleOpen("ACP connect");
+      validateRootIdentity(sessionRoot);
+    } catch (error: unknown) {
+      await shutdownAcpOwnership();
+      throw error;
+    }
+  }
+
+  async function runPromptPayload(chatId: number, payload: PromptPayload, promptId: string): Promise<void> {
     lastInboundPromptAt = nowIso();
-    collectedArtifacts.clear();
     setThoughtDraft(chatId, null);
     setPlanMessageId(chatId, null);
 
     try {
-      await acpClient.connect();
+      await connectAuthorizedRoot();
       const caps = acpClient.getPromptCapabilities();
       const { blocks } = buildPromptBlocks({
         text: payload.text,
@@ -463,11 +498,12 @@ export function createBridge(config: Config): Bridge {
         : blocks;
 
       await acpClient.sendPrompt(finalBlocks.length === 1 ? finalBlocks[0]! : finalBlocks);
-      await onPromptComplete(getCurrentAssistantText(), chatId);
+      await onPromptComplete(getCurrentAssistantText(), chatId, promptId);
     } catch (error: unknown) {
       const correlationId = `grok-${Date.now().toString(36)}`;
       console.error(`[${correlationId}] Grok prompt failed: ${sanitizedError(error)}`);
-      if (!getActivePrompt()?.cancelling) {
+      const current = getActivePrompt();
+      if (current?.id === promptId && !current.cancelling) {
         try {
           await sendMessage(
             chatId,
@@ -477,24 +513,34 @@ export function createBridge(config: Config): Bridge {
           console.error(`[${correlationId}] Error notice delivery failed: ${sanitizedError(deliveryError)}`);
         }
       }
-      await clearStalePromptCard(getActivePrompt());
-      clearActivePrompt();
-      stopTyping();
-      resetStreamDraftState();
-      await dismissBubble();
+      if (getActivePrompt()?.id === promptId) {
+        await clearStalePromptCard(getActivePrompt());
+        stopTyping();
+        resetStreamDraftState();
+        await dismissBubble();
+      }
     } finally {
-      cleanupInboxFiles(payload.inboxFiles.map((f) => f.path));
+      closingPromptUiIds.add(promptId);
+      await resetAndWaitForStreamDrafts();
+      await waitForPromptUiTasks(promptId);
+      cleanupInboxFiles(payload.inboxFiles);
     }
   }
 
   async function executePrompt(chatId: number, payload: PromptPayload): Promise<void> {
     if (promptTask) throw new Error("A prompt task is already active");
-    const task = runPromptPayload(chatId, payload);
+    const active = getActivePrompt();
+    if (!active || active.chatId !== chatId) throw new Error("Active prompt ownership is missing");
+    const task = runPromptPayload(chatId, payload, active.id);
     promptTask = task;
     try {
       await task;
     } finally {
-      if (promptTask === task) promptTask = null;
+      if (promptTask === task) {
+        if (getActivePrompt()?.id === active.id) clearActivePrompt();
+        promptTask = null;
+      }
+      closingPromptUiIds.delete(active.id);
       if (!queuePaused && !drainingQueue && !getActivePrompt() && !acpClient.isPromptRunning()) {
         void drainQueue();
       }
@@ -511,7 +557,7 @@ export function createBridge(config: Config): Bridge {
   }
 
   async function drainQueue(): Promise<void> {
-    if (shuttingDown || queuePaused || drainingQueue || promptTask || getActivePrompt() || acpClient.isPromptRunning()) return;
+    if (shuttingDown || lifecycleCompromised || queuePaused || drainingQueue || promptTask || getActivePrompt() || acpClient.isPromptRunning()) return;
     const next = dequeuePrompt();
     if (!next) return;
     drainingQueue = true;
@@ -522,7 +568,7 @@ export function createBridge(config: Config): Bridge {
         next.chatId,
         next.messageId,
         next.userId,
-        next.inboxFiles.map((f) => f.path),
+        next.inboxFiles,
       );
       await executePrompt(next.chatId, {
         text: next.text,
@@ -537,15 +583,18 @@ export function createBridge(config: Config): Bridge {
     }
   }
 
-  async function onPromptComplete(finalText: string | undefined, chatIdHint?: number): Promise<void> {
+  async function onPromptComplete(
+    finalText: string | undefined,
+    chatIdHint: number | undefined,
+    promptId: string,
+  ): Promise<void> {
     const active = getActivePrompt();
+    if (!active || active.id !== promptId) return;
     const chatId = active?.chatId ?? chatIdHint;
     const chats = chatId != null ? [chatId] : [];
     const toolCount = active?.toolCount ?? getToolsSeenCount();
     const textFromStream = (finalText ?? "").trim();
     stopTyping();
-
-    const allArtifacts = [...collectedArtifacts];
 
     try {
       if (textFromStream && chats.length) {
@@ -556,10 +605,9 @@ export function createBridge(config: Config): Bridge {
           setLastFinalResponse({
             chatId: chats[0]!,
             text: textFromStream,
-            artifactPaths: allArtifacts,
             savedAt: Date.now(),
           });
-          // fall through to still try artifacts / retry storage
+          // Keep the response available for /retry last.
         }
       } else if (chats.length) {
         resetStreamDraftState();
@@ -571,65 +619,75 @@ export function createBridge(config: Config): Bridge {
         resetStreamDraftState();
       }
 
-      if (chats.length && allArtifacts.length) {
-        await deliverArtifacts(chats[0]!, allArtifacts);
-      }
-
       if (chats.length) {
         setLastFinalResponse({
           chatId: chats[0]!,
           text: textFromStream,
-          artifactPaths: allArtifacts,
           savedAt: Date.now(),
         });
       }
     } finally {
-      await dismissBubble();
-      if (chats[0] != null) setThoughtDraft(chats[0], null);
-      await clearStalePromptCard(active);
-      clearActivePrompt();
-      writeHealthSnapshot(config, "prompt-done", buildExtra(), { force: true });
-      collectedArtifacts.clear();
+      if (getActivePrompt()?.id === promptId) {
+        await dismissBubble();
+        if (chats[0] != null) setThoughtDraft(chats[0], null);
+        await clearStalePromptCard(active);
+        writeHealthSnapshot(config, "prompt-done", buildExtra(), { force: true });
+      }
     }
+  }
+
+  async function stopPromptTaskForTransition(): Promise<boolean> {
+    try {
+      await acpClient.cancelCurrent();
+    } catch (error: unknown) {
+      console.warn(`[ACP] Graceful cancel failed: ${sanitizedError(error)}`);
+    }
+    if (await waitForPromptTask(config.CANCEL_WAIT_MS)) return true;
+
+    console.warn("[ACP] Prompt task did not settle after cancel; terminating the old ACP process");
+    await shutdownAcpOwnership();
+    const settled = await waitForPromptTask(config.API_TIMEOUT_MS + 5_000);
+    if (!settled) lifecycleCompromised = true;
+    return settled;
   }
 
   const deps = {
     config,
-    canAcceptPrompts: () => !shuttingDown,
+    canAcceptPrompts: () => !shuttingDown && !lifecycleCompromised && !queuePaused,
+    getSessionRoot: () => sessionRoot,
     onPrompt: async (chatId: number, payload: PromptPayload, _userId: number) => {
       await executePrompt(chatId, payload);
     },
     onCancel: async (chatId: number, userId: number, clearQueue: boolean) => {
+      const wasQueuePaused = queuePaused;
+      queuePaused = true;
       const ap = getActivePrompt();
       if (!ap || ap.chatId !== chatId || ap.userId !== userId) {
-        const permissionCleanup = !ap ? cancelPendingPermission() : null;
-        await permissionCleanup;
-        const permissionCancelled = permissionCleanup !== null;
-        if (clearQueue) {
-          const cleared = clearPromptQueue();
-          for (const item of cleared) {
-            cleanupInboxFiles(item.inboxFiles.map((f) => f.path));
+        try {
+          const permissionCleanup = !ap ? cancelPendingPermission() : null;
+          await permissionCleanup;
+          const permissionCancelled = permissionCleanup !== null;
+          if (clearQueue) {
+            const cleared = clearPromptQueue();
+            for (const item of cleared) cleanupInboxFiles(item.inboxFiles);
+            return { cancelled: permissionCancelled, queueCleared: cleared.length };
           }
-          return { cancelled: permissionCancelled, queueCleared: cleared.length };
+          return { cancelled: permissionCancelled, queueCleared: 0 };
+        } finally {
+          if (!lifecycleCompromised) queuePaused = wasQueuePaused;
+          if (!queuePaused && !promptTask && !getActivePrompt() && !acpClient.isPromptRunning()) {
+            void drainQueue();
+          }
         }
-        return { cancelled: permissionCancelled, queueCleared: 0 };
       }
-      queuePaused = true;
       try {
         markActivePromptCancelling();
         const permissionCleanup = cancelPendingPermission();
-        await acpClient.cancelCurrent();
+        const taskSettled = await stopPromptTaskForTransition();
         await permissionCleanup;
-        let idle = await acpClient.waitForIdle(config.CANCEL_WAIT_MS);
-        if (!idle) {
-          console.warn("[ACP] Cancel wait timed out; restarting ACP to guarantee prompt termination");
-          await acpClient.restart();
-          idle = true;
-        }
-        const taskSettled = await waitForPromptTask(config.CANCEL_WAIT_MS);
         if (!taskSettled) {
-          console.warn("[ACP] Prompt task did not settle after cancellation; keeping bridge busy");
-        } else {
+          console.error("[ACP] Prompt task remained active after process termination; bridge stays busy");
+        } else if (getActivePrompt()?.id === ap.id) {
           clearActivePrompt();
         }
         stopTyping();
@@ -642,7 +700,7 @@ export function createBridge(config: Config): Bridge {
           const cleared = clearPromptQueue();
           queueCleared = cleared.length;
           for (const item of cleared) {
-            cleanupInboxFiles(item.inboxFiles.map((file) => file.path));
+            cleanupInboxFiles(item.inboxFiles);
           }
         }
         try {
@@ -657,8 +715,10 @@ export function createBridge(config: Config): Bridge {
         }
         return { cancelled: true, queueCleared };
       } finally {
-        queuePaused = false;
-        if (!promptTask && !getActivePrompt() && !acpClient.isPromptRunning()) void drainQueue();
+        if (!lifecycleCompromised) queuePaused = wasQueuePaused;
+        if (!queuePaused && !promptTask && !getActivePrompt() && !acpClient.isPromptRunning()) {
+          void drainQueue();
+        }
       }
     },
     onNewSession: async (chatId: number, userId: number) => {
@@ -669,32 +729,38 @@ export function createBridge(config: Config): Bridge {
         const permissionCleanup = cancelPendingPermission();
         const cleared = clearPromptQueue();
         for (const item of cleared) {
-          cleanupInboxFiles(item.inboxFiles.map((file) => file.path));
+          cleanupInboxFiles(item.inboxFiles);
         }
-        let restarted = false;
         if (ap) {
           markActivePromptCancelling();
-          await acpClient.cancelCurrent();
+          const taskSettled = await stopPromptTaskForTransition();
           await permissionCleanup;
-          const idle = await acpClient.waitForIdle(config.CANCEL_WAIT_MS);
-          if (!idle) {
-            await acpClient.restart();
-            restarted = true;
+          if (!taskSettled) {
+            console.error("[ACP] Refusing /new because the previous prompt task is still active");
+            return false;
           }
-          await waitForPromptTask(config.CANCEL_WAIT_MS);
-          clearActivePrompt();
         } else {
+          const taskSettled = promptTask ? await stopPromptTaskForTransition() : true;
           await permissionCleanup;
+          if (!taskSettled) return false;
         }
+        await shutdownAcpOwnership();
+        if (!(await waitForPromptTask(config.API_TIMEOUT_MS + 5_000))) {
+          console.error("[ACP] Refusing /new because prompt delivery did not settle");
+          return false;
+        }
+        const latePermissionCleanup = cancelPendingPermission();
+        if (!ap || getActivePrompt()?.id === ap.id) clearActivePrompt();
         stopTyping();
         resetStreamDraftState();
         await clearStalePromptCard(ap);
         await dismissBubble();
         resetSessionUiState();
-        if (!restarted) await acpClient.restart();
+        await latePermissionCleanup;
+        await connectAuthorizedRoot();
         return true;
       } finally {
-        queuePaused = false;
+        if (!lifecycleCompromised) queuePaused = false;
       }
     },
     onStatus: async (chatId: number) => {
@@ -730,9 +796,7 @@ export function createBridge(config: Config): Bridge {
         if (last.text) {
           await finalizeStreamDrafts(last.text, [chatId], config);
         }
-        if (last.artifactPaths.length) {
-          await deliverArtifacts(chatId, last.artifactPaths);
-        }
+
         await sendMessage(chatId, "Re-sent last response (no agent re-run).");
       } catch (error: unknown) {
         console.error(`[TG] /retry last failed: ${sanitizedError(error)}`);
@@ -791,30 +855,59 @@ export function createBridge(config: Config): Bridge {
         await sendMessage(chatId, "CWD target is not a directory.");
         return;
       }
-      const previousPath = acpClient.getCwd();
-      await cancelPendingPermission();
-      acpClient.setCwd(resolvedPath);
-      try {
-        await acpClient.restart();
-      } catch (error: unknown) {
-        acpClient.setCwd(previousPath);
-        try {
-          await acpClient.restart();
-        } catch (rollbackError: unknown) {
-          console.error(`[ACP] CWD rollback failed: ${sanitizedError(rollbackError)}`);
-        }
-        await sendMessage(chatId, `Could not switch working directory: ${sanitizedError(error)}`);
+      const nextRoot = allowedRootIdentities.get(resolvedPath);
+      if (!nextRoot) {
+        await sendMessage(chatId, "CWD authorization is unavailable. Restart the bridge and try again.");
         return;
       }
-      setSessionCwd(resolvedPath);
       try {
-        cleanupStaleInbox(resolvedPath);
-      } catch (error: unknown) {
-        console.warn(`[MEDIA] Could not initialize inbox cleanup: ${sanitizedError(error)}`);
+        validateRootIdentity(nextRoot);
+      } catch {
+        await sendMessage(chatId, "CWD target changed after startup. Restart the bridge to re-authorize it.");
+        return;
       }
-      setLastFinalResponse(null);
-      resetSessionUiState();
-      await sendMessage(chatId, `Working directory set to:\n${resolvedPath}\nNew ACP session started.`);
+      queuePaused = true;
+      try {
+        const previousPath = acpClient.getCwd();
+        await cancelPendingPermission();
+        acpExpectedRoot = nextRoot;
+        acpClient.setCwd(resolvedPath);
+        try {
+          requireLifecycleOpen("CWD restart");
+          await acpClient.restart();
+          requireLifecycleOpen("CWD restart");
+          validateRootIdentity(nextRoot);
+        } catch (error: unknown) {
+          await shutdownAcpOwnership();
+          if (shuttingDown || lifecycleCompromised) return;
+          acpExpectedRoot = sessionRoot;
+          acpClient.setCwd(previousPath);
+          try {
+            requireLifecycleOpen("CWD rollback");
+            validateRootIdentity(sessionRoot);
+            await acpClient.restart();
+            requireLifecycleOpen("CWD rollback");
+            validateRootIdentity(sessionRoot);
+          } catch (rollbackError: unknown) {
+            await shutdownAcpOwnership();
+            console.error(`[ACP] CWD rollback failed: ${sanitizedError(rollbackError)}`);
+          }
+          await sendMessage(chatId, `Could not switch working directory: ${sanitizedError(error)}`);
+          return;
+        }
+        sessionRoot = nextRoot;
+        setSessionCwd(sessionRoot.path);
+        try {
+          ensureInboxDir(sessionRoot);
+        } catch (error: unknown) {
+          console.warn(`[MEDIA] Could not initialize inbox: ${sanitizedError(error)}`);
+        }
+        setLastFinalResponse(null);
+        resetSessionUiState();
+        await sendMessage(chatId, `Working directory set to:\n${resolvedPath}\nNew ACP session started.`);
+      } finally {
+        if (!lifecycleCompromised) queuePaused = false;
+      }
     },
     onStaleAction: async (
       chatId: number,
@@ -847,25 +940,25 @@ export function createBridge(config: Config): Bridge {
     },
   };
 
-  const bot = createTelegramBot(config, deps);
+  const bot = (factories.createTelegramBot ?? createTelegramBot)(config, deps);
   botInstance = bot;
 
   function startWatchdog(): void {
     if (watchdogTimer) return;
     watchdogTimer = setInterval(() => {
-      void runWatchdog().catch((error: unknown) => {
-        console.error(`[WATCHDOG] Check failed: ${sanitizedError(error)}`);
-      });
+      const active = getActivePrompt();
+      if (!active || closingPromptUiIds.has(active.id)) return;
+      trackPromptUiTask(active.id, runWatchdog(active));
     }, config.WATCHDOG_INTERVAL_MS);
     watchdogTimer.unref();
   }
 
-  async function runWatchdog(): Promise<void> {
-    const ap = getActivePrompt();
-    if (!ap || ap.cancelling) return;
+  async function runWatchdog(ap: ActivePromptState): Promise<void> {
+    if (getActivePrompt()?.id !== ap.id || ap.cancelling) return;
     const age = ageMs(ap.startedAt);
     const activityAge = ageMs(ap.lastActivityAt ?? ap.startedAt);
     await maybeProgressNotice(ap, age);
+    if (getActivePrompt()?.id !== ap.id) return;
     if (
       activityAge != null
       && activityAge > config.PROMPT_STALE_AFTER_MS
@@ -875,13 +968,18 @@ export function createBridge(config: Config): Bridge {
       stopTyping();
       resetStreamDraftState();
       await dismissBubble();
+      if (getActivePrompt()?.id !== ap.id) return;
       try {
         const sent = await sendMessage(
           ap.chatId,
           `⚠️ ACP appears stalled (${formatAge(activityAge)} without activity).`,
           { reply_markup: stalePromptKeyboard(ap.id) },
         );
-        ap.staleMessageId = sent.message_id;
+        if (getActivePrompt()?.id === ap.id) {
+          ap.staleMessageId = sent.message_id;
+        } else {
+          await editMessageReplyMarkup(ap.chatId, sent.message_id, null);
+        }
       } catch (error: unknown) {
         console.warn(`[WATCHDOG] Stale notice failed: ${sanitizedError(error)}`);
       }
@@ -893,6 +991,7 @@ export function createBridge(config: Config): Bridge {
     ap: ActivePromptState,
     age: number | null,
   ): Promise<void> {
+    if (getActivePrompt()?.id !== ap.id) return;
     if (age == null || age < config.PROGRESS_NOTICE_AFTER_MS) return;
     if (ap.progressNoticeCount >= config.PROGRESS_NOTICE_MAX_ITERATIONS) return;
     const lastAge = ap.lastProgressNoticeAt ? ageMs(ap.lastProgressNoticeAt) : 999999;
@@ -904,6 +1003,7 @@ export function createBridge(config: Config): Bridge {
       Math.max(1, Math.ceil(age / config.PROGRESS_NOTICE_ITERATION_MS)),
     );
     const detail = getPendingPermission() ? "waiting permission" : "working";
+    if (getActivePrompt()?.id !== ap.id) return;
     await sendMessage(
       ap.chatId,
       `⏳ Still working... ${formatAge(age)} — ${detail} (${iteration}/${config.PROGRESS_NOTICE_MAX_ITERATIONS})`,
@@ -916,7 +1016,7 @@ export function createBridge(config: Config): Bridge {
 
     try {
       try {
-        await acpClient.connect();
+        await connectAuthorizedRoot();
       } catch (error: unknown) {
         console.warn(
           `[BRIDGE] Initial ACP connect failed (will retry on first prompt): ${sanitizedError(error)}`,
@@ -965,6 +1065,10 @@ export function createBridge(config: Config): Bridge {
     shuttingDown = true;
     connected = false;
     queuePaused = true;
+    beginOutboundShutdown();
+    const teardownErrors: unknown[] = [];
+    const active = getActivePrompt();
+    if (active) markActivePromptCancelling();
     if (watchdogTimer) {
       clearInterval(watchdogTimer);
       watchdogTimer = null;
@@ -973,33 +1077,69 @@ export function createBridge(config: Config): Bridge {
       clearInterval(lockHeartbeatTimer);
       lockHeartbeatTimer = null;
     }
-    stopTyping();
-    resetStreamDraftState();
-    await dismissBubble();
-
-    await cancelPendingPermission();
-
-    if (botInstance) await stopPolling(botInstance);
-    const active = getActivePrompt();
-    const cleared = clearPromptQueue();
-    for (const item of cleared) {
-      cleanupInboxFiles(item.inboxFiles.map((file) => file.path));
+    if (botInstance) {
+      try {
+        await (factories.stopPolling ?? stopPolling)(botInstance);
+      } catch (error: unknown) {
+        teardownErrors.push(error);
+        console.error(`[TG] Polling shutdown failed; continuing ACP teardown: ${sanitizedError(error)}`);
+      }
     }
 
+    stopTyping();
+    resetStreamDraftState();
+    const permissionCleanup = cancelPendingPermission();
+    const cleared = clearPromptQueue();
+    for (const item of cleared) cleanupInboxFiles(item.inboxFiles);
+
+    if (acpHandle) {
+      try {
+        await acpHandle.cancelCurrent();
+      } catch (error: unknown) {
+        console.warn(`[ACP] Shutdown cancel failed: ${sanitizedError(error)}`);
+      }
+      try {
+        await acpHandle.shutdown();
+      } catch (error: unknown) {
+        lifecycleCompromised = true;
+        console.error(`[ACP] Initial shutdown attempt failed: ${sanitizedError(error)}`);
+      }
+    }
+
+    if (permissionCleanup) await permissionCleanup;
+    await dismissBubble();
+    const promptSettled = !promptTask
+      || await waitForPromptTask(config.CANCEL_WAIT_MS + config.API_TIMEOUT_MS + 5_000);
+    if (!promptSettled) {
+      teardownErrors.push(new Error("Prompt task remained active during shutdown"));
+      console.error("[BRIDGE] Prompt task did not settle; preserving lock until process exit");
+    }
+
+    // A final serialized ACP shutdown closes any reconnect that raced the first attempt.
     if (acpHandle) {
       try {
         await acpHandle.shutdown();
       } catch (error: unknown) {
-        console.error(`[ACP] Shutdown failed: ${sanitizedError(error)}`);
+        lifecycleCompromised = true;
+        teardownErrors.push(error);
+        console.error(`[ACP] Final shutdown failed; preserving lock: ${sanitizedError(error)}`);
       }
     }
-    if (promptTask && !await waitForPromptTask(config.CANCEL_WAIT_MS + config.API_TIMEOUT_MS)) {
-      console.warn("[BRIDGE] Prompt task did not settle before shutdown cleanup");
-    }
+
     await clearStalePromptCard(active);
     if (active) cleanupInboxFiles(active.inboxFiles);
-    clearActivePrompt();
+    if (promptSettled) clearActivePrompt();
+    try {
+      await closeOutboundQueue();
+    } catch (error: unknown) {
+      teardownErrors.push(error);
+      console.error(`[TG] Outbound shutdown failed; preserving lock: ${sanitizedError(error)}`);
+    }
 
+    if (teardownErrors.length) {
+      lifecycleCompromised = true;
+      throw new AggregateError(teardownErrors, "Bridge shutdown did not complete safely");
+    }
     removeLock(config, sessionIdForLock);
     writeHealthSnapshot(config, "shutdown", buildExtra(), { force: true });
   }
