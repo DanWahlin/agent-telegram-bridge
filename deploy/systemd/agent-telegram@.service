@@ -1,0 +1,32 @@
+[Unit]
+Description=Agent Telegram Bridge (%i)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/root/projects/agent-telegram-bridge
+Environment=HOME=/root
+Environment=PATH=/root/.local/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=/etc/agent-telegram/%i.env
+ExecStart=/usr/bin/node /root/projects/agent-telegram-bridge/dist/src/index.js
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=300
+KillMode=control-group
+UMask=0077
+StateDirectory=agent-telegram/%i
+StateDirectoryMode=0700
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=agent-telegram-%i
+
+[Install]
+WantedBy=multi-user.target

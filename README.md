@@ -69,6 +69,26 @@ npm start
 
 Run only one bridge process per bot token. Use one instance per provider (separate token and `STATE_DIR`). Use a process supervisor if the bridge must restart automatically.
 
+### systemd instance
+
+The checked-in template runs one isolated service per provider/bot:
+
+```bash
+sudo install -o root -g root -m 0644 \
+  deploy/systemd/agent-telegram@.service \
+  /etc/systemd/system/agent-telegram@.service
+sudo install -d -o root -g root -m 0700 /etc/agent-telegram
+sudo install -o root -g root -m 0600 \
+  deploy/systemd/copilot.env.example \
+  /etc/agent-telegram/copilot.env
+sudoedit /etc/agent-telegram/copilot.env
+npm run build
+sudo systemctl daemon-reload
+sudo systemctl enable --now agent-telegram@copilot.service
+```
+
+The template assumes this repository is `/root/projects/agent-telegram-bridge` and runs as `root`; edit the unit for another path or service identity. Never start the legacy and shared bridges with the same Telegram token. Verify `health.json`, the ownership-lock PID, and the exact ACP child arguments after every cutover.
+
 ## Telegram commands
 
 | Command | Behavior |

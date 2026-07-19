@@ -39,6 +39,7 @@
   },
   "files": [
     "dist",
+    "deploy",
     ".env.example",
     "AGENTS.md",
     "README.md",
