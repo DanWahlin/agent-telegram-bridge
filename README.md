@@ -32,7 +32,7 @@ It does not expose an inbound HTTP server or Telegram webhook. Run one bridge in
 1. Clone the repository and install dependencies:
 
    ```bash
-   git clone <repository-url> agent-telegram-bridge
+   git clone https://github.com/DanWahlin/agent-telegram-bridge.git
    cd agent-telegram-bridge
    npm ci
    cp .env.example .env
