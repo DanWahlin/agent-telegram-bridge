@@ -89,6 +89,52 @@ sudo systemctl enable --now agent-telegram@copilot.service
 
 The template assumes this repository is `/root/projects/agent-telegram-bridge` and runs as `root`; edit the unit for another path or service identity. Never start the legacy and shared bridges with the same Telegram token. Verify `health.json`, the ownership-lock PID, and the exact ACP child arguments after every cutover.
 
+### Current Copilot deployment on this host
+
+The production Copilot bot uses this shared bridge:
+
+| Item | Value |
+| --- | --- |
+| Repository | `/root/projects/agent-telegram-bridge` |
+| Service | `agent-telegram@copilot.service` |
+| Unit template | `/etc/systemd/system/agent-telegram@.service` |
+| Secret environment | `/etc/agent-telegram/copilot.env` (`0600`; never print or commit) |
+| Runtime state | `/var/lib/agent-telegram/copilot` |
+| Agent workspace | `/root/projects/ZenSquirrel` |
+| Provider command | `copilot --acp --add-dir /root/projects/ZenSquirrel --no-auto-update --no-remote --no-remote-export` |
+| Legacy rollback service | `copilot-cli-telegram.service` (disabled) |
+
+Copilot intentionally receives no `--model` argument, so it uses the account/default model. The systemd template owns the bridge, ACP child, and MCP descendants as one control group.
+
+Check production without exposing the bot token:
+
+```bash
+systemctl status agent-telegram@copilot.service --no-pager
+systemctl show agent-telegram@copilot.service \
+  -p MainPID -p NRestarts -p ControlGroup --no-pager
+journalctl -u agent-telegram@copilot.service -n 150 --no-pager
+```
+
+After a completed prompt, `/var/lib/agent-telegram/copilot/health.json` must report:
+
+```text
+connected: true
+activePrompt: null
+reason: prompt-idle
+likelyState: healthy/idle
+```
+
+Also verify that `lock.json` points to the live systemd `MainPID`, the Copilot child has no `--model` argument, and no legacy extension poller is running.
+
+Rollback only if the shared service cannot be recovered:
+
+```bash
+sudo systemctl disable --now agent-telegram@copilot.service
+sudo systemctl enable --now copilot-cli-telegram.service
+```
+
+Never run both services with the same bot token. The original cutover backup is `/root/backups/agent-telegram-cutover-20260719T222103Z`.
+
 ## Telegram commands
 
 | Command | Behavior |
@@ -208,7 +254,7 @@ Confirm that `AGENT_BIN` points to a working CLI, the CLI is already authenticat
 grok agent --model grok-4.5 stdio
 
 # GitHub Copilot CLI
-copilot --acp --add-dir /absolute/path/to/the/project --no-remote
+copilot --acp --add-dir /absolute/path/to/the/project --no-auto-update --no-remote --no-remote-export
 ```
 
 When `AGENT_ALWAYS_APPROVE=true`, the bridge starts the production child with the exact command:
@@ -243,7 +289,13 @@ npm run build
 npm audit
 ```
 
-`npm run clean` removes only generated `dist` output. It refuses to run when `STATE_DIR` or `AGENT_CWD` resolves inside `dist`, including through a symlink, so cleanup cannot erase runtime identity or an active media workspace.
+`npm run build` runs `npm run clean` first because TypeScript does not remove JavaScript for deleted source files. This prevents stale modules from entering `dist` or the package. The guarded clean removes only generated `dist` output and refuses to run when `STATE_DIR` or `AGENT_CWD` resolves inside `dist`, including through a symlink, so cleanup cannot erase runtime identity or an active media workspace.
+
+Inspect the exact package contents before a release:
+
+```bash
+npm pack --dry-run
+```
 
 Run the live ACP-only smoke test when a working agent CLI is available. It selects the provider from `AGENT_PROVIDER`:
 

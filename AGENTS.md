@@ -34,6 +34,30 @@ This project is a security-sensitive bridge between one private Telegram owner a
 | `src/*.test.ts` | Unit, integration, runtime, and security regression tests |
 | `scripts/clean.ts` | Guarded build cleanup that refuses runtime-path overlap |
 | `scripts/smoke-acp.ts` | Live ACP smoke test without Telegram |
+| `deploy/systemd/agent-telegram@.service` | Shared systemd instance template for one provider/bot per service |
+| `deploy/systemd/copilot.env.example` | Redacted production-style Copilot instance configuration |
+
+## Current production deployment
+
+Copilot is the first production consumer of the shared bridge:
+
+```text
+Repository:    /root/projects/agent-telegram-bridge
+Service:       agent-telegram@copilot.service
+Unit:           /etc/systemd/system/agent-telegram@.service
+Environment:   /etc/agent-telegram/copilot.env
+State:         /var/lib/agent-telegram/copilot
+Agent CWD:     /root/projects/ZenSquirrel
+Legacy service: copilot-cli-telegram.service (disabled; rollback only)
+```
+
+The production Copilot argv is:
+
+```text
+/usr/bin/copilot --acp --add-dir /root/projects/ZenSquirrel --no-auto-update --no-remote --no-remote-export
+```
+
+Never add `--model` for Copilot. Never print or commit `/etc/agent-telegram/copilot.env`. Keep the old extension service disabled unless performing a deliberate rollback, and never let both services poll the same token. The original cutover backup is `/root/backups/agent-telegram-cutover-20260719T222103Z`.
 
 ## Non-negotiable invariants
 
@@ -45,6 +69,7 @@ This project is a security-sensitive bridge between one private Telegram owner a
 - Build every agent launch through `buildAgentLaunch` in `src/agent-launch.ts`. Never pass `--model` to Copilot. Only the Grok child env forces `GROK_CLAUDE_MCPS_ENABLED=false` and `GROK_CLAUDE_HOOKS_ENABLED=false`.
 - Preserve atomic state writes, state-directory symlink refusal, `0700` directory mode, and `0600` file mode.
 - Preserve the one-poller ownership lock and verify ownership before refreshing or removing it.
+- After every completed or failed prompt, persist a fresh health snapshot after clearing prompt ownership. A healthy completed turn has `activePrompt: null`, `reason: prompt-idle`, and `likelyState: healthy/idle`; do not infer a live hang from a stale snapshot.
 - Route Telegram API operations through the shared paced queue so ordering and rate-limit handling stay consistent.
 - Escape agent output before Telegram HTML rendering and allow only explicitly supported link schemes.
 - Sanitize errors before logging or sending them to Telegram.
@@ -71,9 +96,12 @@ npm run lint
 npm test
 npm run build
 npm audit
+npm pack --dry-run
 ```
 
 Use `npm run smoke` only when a local, authenticated agent CLI is available. It selects the provider from `AGENT_PROVIDER` and starts a real ACP subprocess.
+
+`npm run build` must clean `dist` before compiling. TypeScript does not delete emitted JavaScript for removed source files, so building over an old directory can silently package stale modules. Verify removed modules are absent from both `dist` and `npm pack --dry-run` output.
 
 ## Coding conventions
 
@@ -114,6 +142,15 @@ When changing state or configuration:
 - Validate persisted data at runtime.
 - Keep safe defaults and owner-only permissions.
 - Update `.env.example` and `README.md` for any added, removed, or renamed setting.
+- Test the persisted post-turn health state, not only the in-memory active-prompt state.
+
+When changing deployment or provider launch behavior:
+
+- Keep `deploy/systemd/agent-telegram@.service`, its environment examples, and the README commands aligned with production.
+- Validate the unit with `systemd-analyze verify` and compare the checked-in template with the installed unit when working on this host.
+- Prove exactly one poller owns each bot token before and after a cutover.
+- Verify the exact child argv from the live systemd cgroup. Copilot must have no `--model`; Grok model selection remains explicit configuration.
+- Preserve a tested rollback path before disabling or replacing a production instance.
 
 When changing documented behavior:
 
@@ -129,5 +166,6 @@ Never commit:
 - `.agent-telegram-state/`
 - `access.json`, `lock.json`, or `health.json`
 - Logs containing user prompts, agent output, permission payloads, or credentials
+- `/etc/agent-telegram/*.env` and backups containing bot tokens
 
 Use fake values that cannot be mistaken for real credentials in tests and examples.
