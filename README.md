@@ -110,7 +110,6 @@ Copy `.env.example` to `.env`. Primary settings:
 | `ASSISTANT_TEXT_MAX_CHARS` | `200000` | Maximum assistant text retained for one response |
 | `CANCEL_WAIT_MS` | `15000` | Wait for ACP idle after cancel (maximum `30000`) |
 | `RETRY_LAST_TTL_MS` | `1800000` | How long `/retry last` keeps the last response |
-| `COPILOT_COMPLETION_GRACE_MS` | `30000` | Copilot-only quiet grace after assistant text before recovering a missing ACP completion |
 | `PROGRESS_NOTICE_AFTER_MS` | `90000` | First “still working” notice (mobile-friendly default) |
 | `VERBOSE_DEFAULT` | `false` | Start with thought stream enabled |
 

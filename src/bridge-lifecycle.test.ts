@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdtempSync,
   mkdirSync,
+  readFileSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -199,6 +200,12 @@ describe("bridge lifecycle transitions", () => {
       finish();
       await prompt;
       expect(getActivePrompt()).toBeNull();
+      const persistedHealth = JSON.parse(
+        readFileSync(join(stateDir, "health.json"), "utf8"),
+      ) as { activePrompt: unknown; likelyState: string; reason: string };
+      expect(persistedHealth.activePrompt).toBeNull();
+      expect(persistedHealth.likelyState).not.toBe("waiting for ACP response");
+      expect(persistedHealth.reason).toBe("prompt-idle");
     } finally {
       await bridge.shutdown();
     }

@@ -348,7 +348,9 @@ export function createBridge(config: Config, factories: BridgeFactories = {}): B
         : blocks;
 
       await acpClient.sendPrompt(finalBlocks.length === 1 ? finalBlocks[0]! : finalBlocks);
+      console.log(`[BRIDGE] Prompt ${promptId} ACP turn complete; finalizing Telegram output`);
       await onPromptComplete(getCurrentAssistantText(), chatId, promptId);
+      console.log(`[BRIDGE] Prompt ${promptId} Telegram finalization complete`);
     } catch (error: unknown) {
       const correlationId = `agent-${Date.now().toString(36)}`;
       console.error(`[${correlationId}] Agent prompt failed: ${sanitizedError(error)}`);
@@ -371,8 +373,11 @@ export function createBridge(config: Config, factories: BridgeFactories = {}): B
       }
     } finally {
       closingPromptUiIds.add(promptId);
+      console.log(`[BRIDGE] Prompt ${promptId} draining stream tasks`);
       await resetAndWaitForStreamDrafts();
+      console.log(`[BRIDGE] Prompt ${promptId} draining UI tasks`);
       await waitForPromptUiTasks(promptId);
+      console.log(`[BRIDGE] Prompt ${promptId} cleanup complete`);
       cleanupInboxFiles(payload.inboxFiles);
     }
   }
@@ -386,11 +391,18 @@ export function createBridge(config: Config, factories: BridgeFactories = {}): B
     try {
       await task;
     } finally {
+      let clearedPrompt = false;
       if (promptTask === task) {
-        if (getActivePrompt()?.id === active.id) clearActivePrompt();
+        if (getActivePrompt()?.id === active.id) {
+          clearActivePrompt();
+          clearedPrompt = true;
+        }
         promptTask = null;
       }
       closingPromptUiIds.delete(active.id);
+      if (clearedPrompt) {
+        writeHealthSnapshot(config, "prompt-idle", buildExtra(), { force: true });
+      }
       if (!queuePaused && !drainingQueue && !getActivePrompt() && !acpClient.isPromptRunning()) {
         void drainQueue();
       }
