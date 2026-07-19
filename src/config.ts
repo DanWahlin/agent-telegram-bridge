@@ -59,6 +59,7 @@ const EnvSchema = z.object({
   CANCEL_WAIT_MS: z.coerce.number().int().positive().max(30_000).default(15_000),
   RETRY_LAST_TTL_MS: z.coerce.number().int().positive().default(30 * 60 * 1000),
   WATCHDOG_INTERVAL_MS: z.coerce.number().int().positive().default(30_000),
+  COPILOT_COMPLETION_GRACE_MS: z.coerce.number().int().positive().max(5 * 60 * 1000).default(30_000),
   BUBBLE_DEBOUNCE_MS: z.coerce.number().int().positive().default(300),
   THOUGHT_EDIT_INTERVAL_MS: z.coerce.number().int().positive().default(2500),
   VERBOSE_DEFAULT: z

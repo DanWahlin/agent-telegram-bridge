@@ -13,6 +13,7 @@ import type {
 } from "@agentclientprotocol/sdk";
 import type { Config } from "./config.js";
 import { buildAgentLaunch } from "./agent-launch.js";
+import { createCopilotSettleWatchdog } from "./copilot-settle.js";
 import { messageSafeRandom, nowIso, sleep } from "./utils.js";
 import { sanitizedError, sanitizePermissionText } from "./redact.js";
 import {
@@ -345,13 +346,38 @@ export function createAcpClient(
   ): Promise<PromptResponse> {
     await connect();
     const promptSession = session;
+    const promptContext = context;
+    const promptSessionId = sessionId;
     const promptGeneration = generation;
-    if (!promptSession || activePromptGeneration !== null) {
+    if (!promptSession || !promptContext || !promptSessionId || activePromptGeneration !== null) {
       throw new Error(activePromptGeneration !== null ? "A prompt is already active" : "No ACP session");
     }
     const currentPromptEpoch = ++promptEpoch;
     activePromptGeneration = promptGeneration;
     activePromptEpoch = currentPromptEpoch;
+    const settleWatchdog = config.agentProvider === "copilot"
+      ? createCopilotSettleWatchdog({
+          graceMs: config.COPILOT_COMPLETION_GRACE_MS,
+          hasPendingPermission: () => getPendingPermission() !== null,
+          onSettle: async () => {
+            if (generation !== promptGeneration
+              || activePromptGeneration !== promptGeneration
+              || activePromptEpoch !== currentPromptEpoch) return;
+            handlers.onEvent("copilot.completion-grace");
+            console.warn(
+              `[ACP] Copilot streamed assistant text but did not complete within ${config.COPILOT_COMPLETION_GRACE_MS}ms; requesting turn cancellation`,
+            );
+            await withSetupTimeout(
+              promptContext.notify(acp.methods.agent.session.cancel, { sessionId: promptSessionId }),
+              "ACP Copilot settle cancel",
+            );
+          },
+          onError: (error: unknown) => {
+            handlers.onEvent(`copilot.completion-grace-error:${sanitizedError(error, 200)}`);
+            console.error(`[ACP] Copilot settle recovery failed: ${sanitizedError(error)}`);
+          },
+        })
+      : null;
     try {
       handlers.onEvent("prompt.sent");
       const completion = promptSession.prompt(prompt);
@@ -361,6 +387,7 @@ export function createAcpClient(
           handlers.onEvent(`prompt.stop:${message.stopReason}`);
           break;
         }
+        settleWatchdog?.recordUpdate(message.update);
         handlers.onSessionUpdate(message.update);
         const kind = message.update.sessionUpdate;
         handlers.onEvent(kind === "tool_call" || kind === "tool_call_update" ? "tool" : kind);
@@ -368,6 +395,7 @@ export function createAcpClient(
       }
       return await completion;
     } finally {
+      settleWatchdog?.dispose();
       if (activePromptGeneration === promptGeneration) activePromptGeneration = null;
       if (activePromptEpoch === currentPromptEpoch) activePromptEpoch = null;
     }
