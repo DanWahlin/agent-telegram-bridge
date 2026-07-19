@@ -29,13 +29,13 @@ export function permissionKeyboard(
   options.forEach((option, index) => {
     const button = {
       text: PERMISSION_BUTTON_LABELS[option.kind],
-      callback_data: `grok:o:${id}:${index}`,
+      callback_data: `agent:o:${id}:${index}`,
     };
     if (option.kind.startsWith("allow_")) allows.push(button);
     else rejects.push(button);
   });
   if (rejects.length === 0) {
-    rejects.push({ text: "❌ Reject", callback_data: `grok:c:${id}` });
+    rejects.push({ text: "❌ Reject", callback_data: `agent:c:${id}` });
   }
   return { inline_keyboard: [allows, rejects].filter((row) => row.length > 0) };
 }
@@ -43,8 +43,8 @@ export function permissionKeyboard(
 export function stalePromptKeyboard(promptId: string): InlineKeyboardMarkup {
   return {
     inline_keyboard: [[
-      { text: "Cancel", callback_data: `grok:s:${promptId}:cancel` },
-      { text: "Keep waiting", callback_data: `grok:s:${promptId}:keep` },
+      { text: "Cancel", callback_data: `agent:s:${promptId}:cancel` },
+      { text: "Keep waiting", callback_data: `agent:s:${promptId}:keep` },
     ]],
   };
 }
@@ -75,8 +75,8 @@ export function permissionSelectionByKind(
   };
 }
 
-export function pendingPermissionText(summary: string): string {
-  return `⚠️ Grok Build needs approval\n\n${summary}\n\nChoose an option below or reply approve/reject.`;
+export function pendingPermissionText(summary: string, displayName = "The agent"): string {
+  return `⚠️ ${displayName} needs approval\n\n${summary}\n\nChoose an option below or reply approve/reject.`;
 }
 
 export function resolvedPermissionText(summary: string, label: string): string {
@@ -89,7 +89,7 @@ export function expiredPermissionText(summary: string): string {
 
 export function finalizeExistingPermissionText(text: string | undefined, label: string): string {
   const summary = String(text || "Permission request")
-    .replace(/^⚠️ Grok Build needs approval\s*/u, "")
+    .replace(/^⚠️[^\n]*needs approval\s*/u, "")
     .replace(/\s*(?:Tap a button|Choose an option below).*$/su, "")
     .trim() || "Permission request";
   return label === "⌛ Approval expired"

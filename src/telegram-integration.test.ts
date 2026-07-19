@@ -31,7 +31,7 @@ function makeDeps(config: Config) {
   ) => undefined);
   return {
     config,
-    getSessionRoot: () => captureRootIdentity(config.grokCwdAbs),
+    getSessionRoot: () => captureRootIdentity(config.agentCwdAbs),
     onPrompt,
     onCancel: vi.fn(async () => ({ cancelled: true, queueCleared: 0 })),
     onNewSession: vi.fn(async () => true),

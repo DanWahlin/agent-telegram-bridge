@@ -1,13 +1,13 @@
 {
-  "name": "grok-build-telegram",
+  "name": "agent-telegram-bridge",
   "version": "0.1.0",
-  "description": "Secure Telegram bridge for xAI Grok Build using the official Agent Client Protocol (ACP)",
+  "description": "Secure Telegram bridge for coding agents (Grok Build and GitHub Copilot CLI) using the official Agent Client Protocol (ACP)",
   "private": true,
   "type": "module",
   "license": "MIT",
   "main": "dist/src/index.js",
   "bin": {
-    "grok-build-telegram": "dist/src/index.js"
+    "agent-telegram-bridge": "dist/src/index.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json && chmod +x dist/src/index.js",
@@ -40,7 +40,6 @@
   "files": [
     "dist",
     ".env.example",
-    "images/logo.webp",
     "AGENTS.md",
     "README.md",
     "SECURITY.md",

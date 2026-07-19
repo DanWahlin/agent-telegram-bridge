@@ -219,8 +219,8 @@ describe("ACP process ownership", () => {
       chmodSync(executable, 0o700);
       const config = createTestConfig(parent, {
         API_TIMEOUT_MS: 30,
-        GROK_BIN: executable,
-        grokBin: executable,
+        AGENT_BIN: executable,
+        agentBin: executable,
       });
       const root = captureRootIdentity(parent);
       const client = createAcpClient(config, {
@@ -254,8 +254,8 @@ describe("ACP process ownership", () => {
     const parent = mkdtempSync(join(tmpdir(), "grok-tg-spawn-error-"));
     try {
       const config = createTestConfig(parent, {
-        GROK_BIN: "/definitely/missing/grok",
-        grokBin: "/definitely/missing/grok",
+        AGENT_BIN: "/definitely/missing/grok",
+        agentBin: "/definitely/missing/grok",
       });
       const root = captureRootIdentity(parent);
       const client = createAcpClient(config, {

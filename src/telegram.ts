@@ -161,9 +161,9 @@ export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
       return;
     }
     const help = [
-      "Grok Build Telegram Bridge",
+      `${config.agentDisplayName} Telegram Bridge`,
       "",
-      "Send text, photos, documents, voice, or video to prompt Grok Build.",
+      `Send text, photos, documents, voice, or video to prompt ${config.agentDisplayName}.`,
       "Bridge commands:",
       "  /status — health, queue, cwd, usage",
       "  /cancel [queue] — stop active prompt; add queue to clear queue",
@@ -172,7 +172,7 @@ export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
       "  /verbose on|off — thought stream",
       "  /cwd [n|path] — list or switch allowed working directories",
       "",
-      "Other messages are forwarded as prompts (including Grok slash-style text).",
+      "Other messages are forwarded as prompts.",
       "While busy, follow-ups are queued (see PROMPT_QUEUE_MAX).",
       "Permission cards: once / session / reject (or reply approve/reject).",
       "",
@@ -279,7 +279,8 @@ export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
 
   bot.on("callback_query:data", async (ctx) => {
     const data = ctx.callbackQuery?.data || "";
-    if (!data.startsWith("grok:")) {
+    // New payloads use the "agent:" prefix; legacy "grok:" is still accepted for migration.
+    if (!data.startsWith("agent:") && !data.startsWith("grok:")) {
       await answerCallbackQuery(ctx.callbackQuery.id);
       return;
     }
@@ -419,7 +420,7 @@ export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
       const pending = access.pending?.[String(chatId)];
       if (pending) {
         if (completePairing(config, access, chatId, userId, text.trim())) {
-          await sendMessage(chatId, "Paired! You can now send prompts to Grok Build.");
+          await sendMessage(chatId, `Paired! You can now send prompts to ${config.agentDisplayName}.`);
           return;
         }
         const remaining = Math.max(0, 5 - (pending.attempts ?? 0));
@@ -518,7 +519,7 @@ export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
       || (media.files.length ? "User sent media. Please inspect the attached files." : "");
 
     if (!promptText && media.files.length === 0) {
-      await sendMessage(chatId, "Send text or an attachment to prompt Grok Build.");
+      await sendMessage(chatId, `Send text or an attachment to prompt ${config.agentDisplayName}.`);
       return;
     }
 
@@ -538,7 +539,7 @@ export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
         return;
       }
       if (config.PROMPT_QUEUE_MAX <= 0) {
-        await sendMessage(chatId, "Grok is still working on the previous prompt. Use /cancel or wait.");
+        await sendMessage(chatId, `${config.agentDisplayName} is still working on the previous prompt. Use /cancel or wait.`);
         cleanupInboxFiles(media.files);
         return;
       }
@@ -595,7 +596,7 @@ export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
       try {
         await sendMessage(
           chatId,
-          "Grok Build couldn't complete that request. Check the bridge logs for the correlation details.",
+          `${config.agentDisplayName} couldn't complete that request. Check the bridge logs for the correlation details.`,
         );
       } catch (deliveryError: unknown) {
         console.error(`[TG] Failed to deliver prompt error: ${sanitizedError(deliveryError)}`);

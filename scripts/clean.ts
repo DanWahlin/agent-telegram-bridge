@@ -9,9 +9,9 @@ import {
 dotenv.config({ quiet: true });
 
 const buildOutputDir = getBuildOutputDir(import.meta.url);
-const stateDir = resolve(process.env["STATE_DIR"] ?? ".grok-telegram-state");
-const grokCwd = resolve(process.env["GROK_CWD"] ?? process.cwd());
+const stateDir = resolve(process.env["STATE_DIR"] ?? ".agent-telegram-state");
+const agentCwd = resolve(process.env["AGENT_CWD"] ?? process.env["GROK_CWD"] ?? process.cwd());
 
-assertRuntimePathsOutsideBuildOutput(stateDir, grokCwd, buildOutputDir);
+assertRuntimePathsOutsideBuildOutput(stateDir, agentCwd, buildOutputDir);
 await rm(buildOutputDir, { recursive: true, force: true });
 console.log(`Removed build output: ${buildOutputDir}`);

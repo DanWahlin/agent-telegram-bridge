@@ -33,12 +33,12 @@ export function getBuildOutputDir(moduleUrl: string): string {
 
 export function assertRuntimePathsOutsideBuildOutput(
   stateDir: string,
-  grokCwd: string,
+  agentCwd: string,
   buildOutputDir: string,
 ): void {
   const conflicts = [
     ["STATE_DIR", stateDir],
-    ["GROK_CWD", grokCwd],
+    ["AGENT_CWD", agentCwd],
   ] as const;
 
   for (const [label, candidate] of conflicts) {

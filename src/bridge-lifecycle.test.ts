@@ -52,7 +52,7 @@ function idleAcp(config: ReturnType<typeof createTestConfig>): AcpClientHandle {
     isPromptRunning: () => false,
     getPromptCapabilities: () => ({}),
     setCwd: vi.fn(),
-    getCwd: () => config.grokCwdAbs,
+    getCwd: () => config.agentCwdAbs,
   };
 }
 
@@ -107,7 +107,7 @@ describe("bridge lifecycle transitions", () => {
       isPromptRunning: () => promptRunning,
       getPromptCapabilities: () => ({ image: true, audio: true, embeddedContext: true }),
       setCwd: vi.fn(),
-      getCwd: () => config.grokCwdAbs,
+      getCwd: () => config.agentCwdAbs,
     };
 
     const bridge = createBridge(config, {
@@ -172,7 +172,7 @@ describe("bridge lifecycle transitions", () => {
       isPromptRunning: () => false,
       getPromptCapabilities: () => ({}),
       setCwd: vi.fn(),
-      getCwd: () => config.grokCwdAbs,
+      getCwd: () => config.agentCwdAbs,
     };
     const bridge = createBridge(config, {
       createAcpClient: () => handle,
@@ -242,7 +242,7 @@ describe("bridge lifecycle transitions", () => {
       isPromptRunning: () => promptRunning,
       getPromptCapabilities: () => ({ image: true }),
       setCwd: vi.fn(),
-      getCwd: () => config.grokCwdAbs,
+      getCwd: () => config.agentCwdAbs,
     };
 
     const bridge = createBridge(config, {
@@ -416,7 +416,7 @@ describe("bridge lifecycle transitions", () => {
       isPromptRunning: () => false,
       getPromptCapabilities: () => ({}),
       setCwd: vi.fn(),
-      getCwd: () => config.grokCwdAbs,
+      getCwd: () => config.agentCwdAbs,
     };
     const bridge = createBridge(config, {
       createAcpClient: () => handle,

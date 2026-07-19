@@ -5,7 +5,7 @@ import { sanitizedError } from "./redact.js";
 
 async function main() {
   const config = loadConfig();
-  console.log("[GROK-TG] Config loaded. STATE_DIR=", config.stateDir, "GROK_CWD=", config.grokCwdAbs, "ALWAYS_APPROVE=", config.GROK_ALWAYS_APPROVE);
+  console.log("[AGENT-TG] Config loaded. PROVIDER=", config.agentProvider, "STATE_DIR=", config.stateDir, "AGENT_CWD=", config.agentCwdAbs, "ALWAYS_APPROVE=", config.agentAlwaysApprove);
 
   const bridge = createBridge(config);
 
@@ -15,7 +15,7 @@ async function main() {
     requestedExitCode = Math.max(requestedExitCode, exitCode);
     if (shutdownPromise) return shutdownPromise;
     shutdownPromise = (async () => {
-      console.log(`[GROK-TG] shutdown (${reason})`);
+      console.log(`[AGENT-TG] shutdown (${reason})`);
       try {
         await bridge.shutdown();
       } catch (error: unknown) {

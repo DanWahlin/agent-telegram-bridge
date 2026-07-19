@@ -112,12 +112,12 @@ export function loadJsonOrDefault<T>(
     const parsed: unknown = JSON.parse(readFileSync(filePath, "utf-8"));
     const validated = schema.safeParse(parsed);
     if (validated.success) return validated.data;
-    console.warn(`grok-telegram: invalid state shape in ${filePath}, using defaults`);
+    console.warn(`agent-telegram: invalid state shape in ${filePath}, using defaults`);
     return structuredClone(defaultValue);
   } catch (err: unknown) {
     if (isErrnoException(err) && err.code === "ENOENT") return structuredClone(defaultValue);
     if (err instanceof SyntaxError) {
-      console.warn(`grok-telegram: corrupted JSON in ${filePath}, using defaults`);
+      console.warn(`agent-telegram: corrupted JSON in ${filePath}, using defaults`);
       return structuredClone(defaultValue);
     }
     throw err;
@@ -139,7 +139,7 @@ export function saveJsonAtomic(filePath: string, data: unknown, mode = 0o600): v
     try {
       rmSync(tmp, { force: true });
     } catch (error: unknown) {
-      console.warn(`grok-telegram: failed to remove temporary state file: ${sanitizedError(error)}`);
+      console.warn(`agent-telegram: failed to remove temporary state file: ${sanitizedError(error)}`);
     }
   }
 }
@@ -314,7 +314,7 @@ export function removeLock(config: Config, sessionId: string): void {
     try {
       rmSync(lockPath(config), { force: true });
     } catch (error: unknown) {
-      console.warn(`grok-telegram: failed to remove lock: ${sanitizedError(error)}`);
+      console.warn(`agent-telegram: failed to remove lock: ${sanitizedError(error)}`);
     }
   }
 }
@@ -750,7 +750,7 @@ export function writeHealthSnapshot(
     saveJsonAtomic(healthPath(config), snap, 0o600);
     lastHealthWriteAt = now;
   } catch (err: unknown) {
-    console.error(`grok-telegram: failed to write health snapshot: ${sanitizedError(err)}`);
+    console.error(`agent-telegram: failed to write health snapshot: ${sanitizedError(err)}`);
   }
 }
 

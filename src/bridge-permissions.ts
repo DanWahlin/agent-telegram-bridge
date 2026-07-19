@@ -51,7 +51,7 @@ export function createPermissionCards(
     const keyboard = permissionKeyboard(id, options);
     const msgs: PermissionCardTarget[] = [];
     const safeSummary = sanitizePermissionText(summary, config.PERMISSION_SUMMARY_MAX);
-    const text = pendingPermissionText(safeSummary);
+    const text = pendingPermissionText(safeSummary, config.agentDisplayName);
     if (chats.length === 0) {
       throw new Error("No active Telegram chat available for ACP permission request");
     }

@@ -12,6 +12,7 @@ import type {
   ToolCallUpdate,
 } from "@agentclientprotocol/sdk";
 import type { Config } from "./config.js";
+import { buildAgentLaunch } from "./agent-launch.js";
 import { messageSafeRandom, nowIso, sleep } from "./utils.js";
 import { sanitizedError, sanitizePermissionText } from "./redact.js";
 import {
@@ -54,21 +55,6 @@ export interface AcpClientHandle {
   getPromptCapabilities: () => PromptCapabilities;
   setCwd: (cwd: string) => void;
   getCwd: () => string;
-}
-
-export function buildGrokChildEnv(parentEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const childEnv: NodeJS.ProcessEnv = {
-    // The bridge owns Telegram transport. Grok must not import Claude-compatible
-    // MCPs/hooks, especially the root Claude Telegram plugin, or it can launch a
-    // competing Bot API poller and wedge both bridges.
-    GROK_CLAUDE_MCPS_ENABLED: "false",
-    GROK_CLAUDE_HOOKS_ENABLED: "false",
-  };
-  for (const key of ["HOME", "PATH", "LANG", "LC_ALL", "TERM", "TMPDIR", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "SSL_CERT_FILE", "SSL_CERT_DIR", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"]) {
-    const value = parentEnv[key];
-    if (value) childEnv[key] = value;
-  }
-  return childEnv;
 }
 
 export function verifyProcessCwdIdentity(
@@ -116,14 +102,14 @@ export async function terminateChildProcess(
   try {
     running.kill("SIGTERM");
   } catch (error: unknown) {
-    console.warn(`[ACP] Failed to terminate Grok process: ${sanitizedError(error)}`);
+    console.warn(`[ACP] Failed to terminate agent process: ${sanitizedError(error)}`);
   }
   let provenExited = await exitsWithin(exited, graceMs);
   if (!provenExited) {
     try {
       running.kill("SIGKILL");
     } catch (error: unknown) {
-      console.warn(`[ACP] Failed to kill unresponsive Grok process: ${sanitizedError(error)}`);
+      console.warn(`[ACP] Failed to kill unresponsive agent process: ${sanitizedError(error)}`);
     }
     provenExited = await exitsWithin(exited, killWaitMs);
   }
@@ -152,7 +138,7 @@ export function createAcpClient(
   let activePromptGeneration: number | null = null;
   let activePromptEpoch: number | null = null;
   let promptCapabilities: PromptCapabilities = {};
-  let sessionCwd = getSessionCwd(config.grokCwdAbs);
+  let sessionCwd = getSessionCwd(config.agentCwdAbs);
   let lifecycleEpoch = 0;
   let lifecycleTail: Promise<void> = Promise.resolve();
 
@@ -203,11 +189,7 @@ export function createAcpClient(
       throw new Error("Previous ACP prompt task has not settled");
     }
 
-    const args = ["agent", "--model", config.GROK_MODEL];
-    if (config.GROK_ALWAYS_APPROVE) args.push("--always-approve");
-    args.push("stdio");
-
-    const childEnv = buildGrokChildEnv(process.env);
+    const launch = buildAgentLaunch(config, sessionCwd);
     const expectedRoot = handlers.getExpectedRootIdentity();
     if (expectedRoot.path !== sessionCwd) {
       throw new Error("ACP CWD path does not match its authorized root identity");
@@ -216,10 +198,10 @@ export function createAcpClient(
     if (expectedLifecycleEpoch !== lifecycleEpoch) {
       throw new Error("ACP connection attempt was superseded by shutdown");
     }
-    const spawned = (runtime.spawn ?? spawn)(config.grokBin, args, {
+    const spawned = (runtime.spawn ?? spawn)(launch.command, launch.args, {
       cwd: sessionCwd,
       stdio: ["pipe", "pipe", "pipe"],
-      env: childEnv,
+      env: launch.env,
       shell: false,
     });
     const connectionGeneration = ++generation;
@@ -235,7 +217,7 @@ export function createAcpClient(
     });
     spawned.stderr?.on("data", (chunk: Buffer) => {
       const line = sanitizePermissionText(chunk.toString("utf8"), 1000);
-      if (line) console.error(`[GROK] ${line}`);
+      if (line) console.error(`[${config.agentProvider.toUpperCase()}] ${line}`);
     });
     spawned.once("exit", (code, signal) => {
       if (child === spawned && generation === connectionGeneration) {
@@ -272,7 +254,7 @@ export function createAcpClient(
       Readable.toWeb(spawned.stdout!),
     );
     const app = acp
-      .client({ name: "grok-build-telegram" })
+      .client({ name: "agent-telegram-bridge" })
       .onRequest(acp.methods.client.session.requestPermission, async ({ params }) => {
         handlers.onEvent("permission.request");
         const requestPromptEpoch = activePromptEpoch;
@@ -303,7 +285,7 @@ export function createAcpClient(
       nextContext.request(acp.methods.agent.initialize, {
         protocolVersion: acp.PROTOCOL_VERSION,
         clientCapabilities: {},
-        clientInfo: { name: "grok-build-telegram", version: "0.1.0" },
+        clientInfo: { name: "agent-telegram-bridge", version: "0.1.0" },
       }),
       "ACP initialize",
     );
@@ -336,7 +318,7 @@ export function createAcpClient(
     sessionId = nextSession.sessionId;
     connected = true;
     console.log(
-      `[ACP] Grok session ${sessionId} connected with model ${config.GROK_MODEL} cwd=${sessionCwd} caps=${JSON.stringify(promptCapabilities)}`,
+      `[ACP] ${config.agentDisplayName} session ${sessionId} connected (provider=${config.agentProvider}) cwd=${sessionCwd} caps=${JSON.stringify(promptCapabilities)}`,
     );
     writeHealthSnapshot(config, "acp-session-created", {
       connected: true,

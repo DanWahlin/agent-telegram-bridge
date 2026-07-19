@@ -1,27 +1,30 @@
-# Grok Build Telegram Bridge
+# Agent Telegram Bridge
 
-<p align="center">
-  <img src="images/logo.webp" alt="Grok Build Telegram logo" width="400">
-</p>
+Run a local coding-agent session from a private Telegram chat. The bridge speaks the official [Agent Client Protocol (ACP)](https://agentclientprotocol.com) over stdio and supports two providers, selected with `AGENT_PROVIDER`:
 
-Run an xAI Grok Build coding-agent session from a private Telegram chat. The bridge uses the official [Agent Client Protocol (ACP)](https://agentclientprotocol.com) over `grok agent --model grok-4.5 stdio`; it does not expose an inbound HTTP server or Telegram webhook.
+- **`grok`** — xAI Grok Build via `grok agent --model grok-4.5 stdio`
+- **`copilot`** — GitHub Copilot CLI via `copilot --acp --add-dir <cwd> --no-auto-update --no-remote --no-remote-export`
+
+It does not expose an inbound HTTP server or Telegram webhook. Run one bridge instance per provider, each with its own bot token and state directory.
 
 ## Features
 
 - **Secure by default**: private chats only, one numeric Telegram owner, expiring attempt-limited pairing codes, and atomic owner-only state files.
 - **Multimodal prompts**: text, photos, documents, voice, and video are downloaded into a descriptor-bound, owner-only inbox under the authorized session CWD. Inbox paths are opened without following symlinks, and admitted file identity, size, and content digest are revalidated before use. Files are sent as ACP content blocks when supported, otherwise as a `resource_link` backed by a process-owned file descriptor that remains open only for the prompt lifetime.
 - **Prompt queue**: text follow-ups while ACP is busy are queued in memory (default depth 3) instead of hard-rejected. The queue is intentionally volatile across restarts; media follow-ups must wait for the active prompt.
-- **Interactive permissions**: choose **Allow once**, **Allow for session**, or the reject options offered by ACP. Resolved cards are replaced with their final status, and expired cards lose their buttons. Permissions are never approved automatically unless `GROK_ALWAYS_APPROVE=true` (which prefers the session-scoped option).
+- **Interactive permissions**: choose **Allow once**, **Allow for session**, or the reject options offered by ACP. Resolved cards are replaced with their final status, and expired cards lose their buttons. Permissions are never approved automatically unless `AGENT_ALWAYS_APPROVE=true` (Grok prefers the session-scoped option; Copilot launches with `--allow-all`).
 - **Streaming responses**: throttled draft edits, ordered multi-message final responses, typing indicators, tool-progress bubbles, progress notices, plan cards, optional thought stream (`/verbose`), and stall recovery buttons.
 - **Single-poller protection**: a PID, hostname, process-start token, and heartbeat lock prevent competing bridge instances.
 - **Operational visibility**: `/status` and `health.json` report session, prompt, permission, queue, cwd, usage, and tool activity.
-- **Child environment minimization**: the Telegram token is omitted from the Grok subprocess environment, and sensitive values are redacted from permission summaries and logs. This is not an OS sandbox; see [Security model and limitations](#security-model-and-limitations).
+- **Child environment minimization**: the Telegram token is omitted from the agent subprocess environment, and sensitive values are redacted from permission summaries and logs. This is not an OS sandbox; see [Security model and limitations](#security-model-and-limitations).
 
 ## Requirements
 
 - Linux with a mounted `/proc` filesystem. The bridge verifies the spawned ACP process through `/proc/<pid>/cwd` and fails closed when that identity proof is unavailable.
 - Node.js 24 or later
-- A locally installed and authenticated Grok CLI with access to the `grok-4.5` model
+- One locally installed and authenticated agent CLI:
+  - Grok CLI with access to the `grok-4.5` model, or
+  - GitHub Copilot CLI at `/usr/bin/copilot` (or set `AGENT_BIN`) with ACP support
 - A Telegram bot token from [@BotFather](https://t.me/BotFather)
 
 ## Quick start
@@ -29,8 +32,8 @@ Run an xAI Grok Build coding-agent session from a private Telegram chat. The bri
 1. Clone the repository and install dependencies:
 
    ```bash
-   git clone https://github.com/DanWahlin/grok-build-telegram.git
-   cd grok-build-telegram
+   git clone <repository-url> agent-telegram-bridge
+   cd agent-telegram-bridge
    npm ci
    cp .env.example .env
    ```
@@ -39,10 +42,11 @@ Run an xAI Grok Build coding-agent session from a private Telegram chat. The bri
 
    ```dotenv
    TELEGRAM_BOT_TOKEN=your-bot-token
-   GROK_CWD=/absolute/path/to/the/project
+   AGENT_PROVIDER=grok
+   AGENT_CWD=/absolute/path/to/the/project
    ```
 
-   `GROK_CWD` is the directory the Grok agent can inspect and modify. Use the narrowest practical project directory. Do not point it at the bridge installation or any directory containing `.env`, credentials, private keys, or unrelated repositories.
+   Set `AGENT_PROVIDER` to `grok` or `copilot`. `AGENT_CWD` is the directory the agent can inspect and modify. Use the narrowest practical project directory. Do not point it at the bridge installation or any directory containing `.env`, credentials, private keys, or unrelated repositories. Legacy `GROK_*` variable names are still accepted for Grok migration.
 
 3. Start the bridge in development mode:
 
@@ -63,7 +67,7 @@ npm run build
 npm start
 ```
 
-Run only one bridge process for a bot token. Use a process supervisor if the bridge must restart automatically.
+Run only one bridge process per bot token. Use one instance per provider (separate token and `STATE_DIR`). Use a process supervisor if the bridge must restart automatically.
 
 ## Telegram commands
 
@@ -71,7 +75,7 @@ Run only one bridge process for a bot token. Use a process supervisor if the bri
 | --- | --- |
 | `/start`, `/help` | Show usage and pairing guidance |
 | `/status` | Bridge, ACP, queue, cwd, usage, and activity status |
-| `/new` | Stop the current Grok subprocess, clear queued prompts, and create a fresh ACP session |
+| `/new` | Stop the current agent subprocess, clear queued prompts, and create a fresh ACP session |
 | `/cancel` | Cancel the active ACP prompt (waits for idle) |
 | `/cancel queue` | Cancel active prompt if any, and clear the follow-up queue |
 | `/retry last` | Re-send the last final text response (no agent re-run) |
@@ -79,7 +83,7 @@ Run only one bridge process for a bot token. Use a process supervisor if the bri
 | `/cwd` | List allowlisted working directories |
 | `/cwd <n\|path>` | Switch CWD (allowlist only) and restart the ACP session |
 
-Any other message text is forwarded as a prompt (including Grok slash-style text such as planning requests).
+Any other message text is forwarded as a prompt.
 
 ## Configuration
 
@@ -88,12 +92,14 @@ Copy `.env.example` to `.env`. Primary settings:
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `TELEGRAM_BOT_TOKEN` | Required | Token issued by @BotFather |
-| `GROK_CWD` | Current directory | Working directory available to Grok |
-| `GROK_CWD_ALLOWLIST` | (primary only) | Comma-separated paths allowed for `/cwd` |
-| `GROK_BIN` | `grok` | Grok executable path; common user locations are also detected |
-| `GROK_MODEL` | `grok-4.5` | Model passed to `grok agent` |
-| `STATE_DIR` | `./.grok-telegram-state` | Directory for access, lock, and health state |
-| `GROK_ALWAYS_APPROVE` | `false` | Auto-approve ACP permissions (prefers the session-scoped option) |
+| `AGENT_PROVIDER` | `grok` | Coding agent to bridge: `grok` or `copilot` |
+| `AGENT_CWD` | Current directory | Working directory available to the agent |
+| `AGENT_CWD_ALLOWLIST` | (primary only) | Comma-separated paths allowed for `/cwd` |
+| `AGENT_BIN` | `grok` / `/usr/bin/copilot` | Agent executable path (provider default; common Grok user locations are also detected) |
+| `AGENT_MODEL` | `grok-4.5` | Model passed to `grok agent`. Ignored for Copilot (never sent a `--model`) |
+| `AGENT_DISPLAY_NAME` | provider default | Name shown in help, permission cards, and errors |
+| `STATE_DIR` | `./.agent-telegram-state` | Directory for access, lock, and health state |
+| `AGENT_ALWAYS_APPROVE` | `false` | Auto-approve ACP permissions (Grok prefers session-scoped; Copilot uses `--allow-all`) |
 | `PAIRING_PENDING_MAX` | `100` | Maximum simultaneous unpaired chat challenges |
 | `MEDIA_MAX_BYTES` | `20971520` | Max attachment size (20 MiB) |
 | `MEDIA_MIME_ALLOWLIST` | images/audio/video/pdf/text… | Comma-separated MIME allowlist |
@@ -107,6 +113,8 @@ Copy `.env.example` to `.env`. Primary settings:
 | `PROGRESS_NOTICE_AFTER_MS` | `90000` | First “still working” notice (mobile-friendly default) |
 | `VERBOSE_DEFAULT` | `false` | Start with thought stream enabled |
 
+Legacy `GROK_CWD`, `GROK_CWD_ALLOWLIST`, `GROK_BIN`, `GROK_MODEL`, and `GROK_ALWAYS_APPROVE` names remain accepted for Grok migration; the `AGENT_*` names take precedence.
+
 `.env.example` documents all optional runtime limits and timing controls for pairing, permissions, streaming, typing, progress notices, health writes, API calls, and outbound pacing.
 
 ## How it works
@@ -117,7 +125,7 @@ flowchart LR
     gate -- No --> rejected["Reject or pair"]
     gate -- Yes --> busy{"Active ACP prompt?"}
     busy -- Yes --> queue["Telegram-side queue"]
-    busy -- No --> acp["Persistent Grok ACP session<br/>ContentBlock prompt"]
+    busy -- No --> acp["Persistent agent ACP session<br/>ContentBlock prompt"]
     queue --> acp
     acp -- Text chunks --> response["Draft edits and final messages"]
     acp -- Tool updates --> bubble["Tool-progress bubble"]
@@ -152,14 +160,14 @@ Inbox files for media live under `<session CWD>/.tg-inbox/` (not `STATE_DIR`). T
 - The first successfully paired Telegram user becomes the only owner. Pairing closes after that.
 - Commands, prompts, callbacks, and permission decisions are accepted only from the owner in a private chat.
 - Pairing codes expire and allow at most five attempts.
-- The Grok subprocess receives an explicit environment allowlist and does not inherit `TELEGRAM_BOT_TOKEN`.
-- Environment filtering is not a sandbox. A Grok process running as the same operating-system user may read any file that user can access, including bridge configuration if filesystem permissions allow it. Keep the bridge installation and secrets outside `GROK_CWD`; use a separate execution identity or sandbox when the agent must not share that trust boundary.
+- The agent subprocess receives an explicit environment allowlist and does not inherit `TELEGRAM_BOT_TOKEN`.
+- Environment filtering is not a sandbox. An agent process running as the same operating-system user may read any file that user can access, including bridge configuration if filesystem permissions allow it. Keep the bridge installation and secrets outside `AGENT_CWD`; use a separate execution identity or sandbox when the agent must not share that trust boundary.
 - ACP permission decisions are bound to the active request, owner, and chat.
-- `GROK_ALWAYS_APPROVE=true` removes the interactive safety boundary. Leave it disabled unless the agent and working directory are fully trusted.
+- `AGENT_ALWAYS_APPROVE=true` removes the interactive safety boundary. Leave it disabled unless the agent and working directory are fully trusted.
 - Media ingress enforces MIME allowlists and size caps. Automatic outbound local-file delivery is disabled until ACP exposes a narrow artifact contract.
-- One bridge supports one owner, one Grok subprocess, and one active ACP prompt at a time.
-- Use a least-privilege operating-system account and a narrowly scoped `GROK_CWD`.
-- `/cwd` can only switch among `GROK_CWD` and `GROK_CWD_ALLOWLIST` paths that exist on disk.
+- One bridge supports one owner, one agent subprocess, and one active ACP prompt at a time. Run separate instances (distinct bot tokens and `STATE_DIR`) for different providers.
+- Use a least-privilege operating-system account and a narrowly scoped `AGENT_CWD`.
+- `/cwd` can only switch among `AGENT_CWD` and `AGENT_CWD_ALLOWLIST` paths that exist on disk.
 
 ## Troubleshooting
 
@@ -171,18 +179,26 @@ Another process is using the same bot token. Stop the other process before resta
 
 The code is intentionally printed only in the bridge terminal. Send any message to the bot in a private chat, then check the terminal output.
 
-**Grok does not connect**
+**The agent does not connect**
 
-Confirm that `GROK_BIN` points to a working CLI, the CLI is already authenticated, `GROK_CWD` exists, and this command works locally:
+Confirm that `AGENT_BIN` points to a working CLI, the CLI is already authenticated, `AGENT_CWD` exists, and the provider's ACP command works locally:
 
 ```bash
+# Grok
 grok agent --model grok-4.5 stdio
+
+# GitHub Copilot CLI
+copilot --acp --add-dir /absolute/path/to/the/project --no-remote
 ```
 
-When `GROK_ALWAYS_APPROVE=true`, the bridge starts the production child with the exact command:
+When `AGENT_ALWAYS_APPROVE=true`, the bridge starts the production child with the exact command:
 
 ```bash
+# Grok
 grok agent --model grok-4.5 --always-approve stdio
+
+# GitHub Copilot CLI (no --model is ever added)
+copilot --acp --add-dir /absolute/path/to/the/project --no-auto-update --no-remote --no-remote-export --allow-all
 ```
 
 **A prompt appears stalled**
@@ -207,9 +223,9 @@ npm run build
 npm audit
 ```
 
-`npm run clean` removes only generated `dist` output. It refuses to run when `STATE_DIR` or `GROK_CWD` resolves inside `dist`, including through a symlink, so cleanup cannot erase runtime identity or an active media workspace.
+`npm run clean` removes only generated `dist` output. It refuses to run when `STATE_DIR` or `AGENT_CWD` resolves inside `dist`, including through a symlink, so cleanup cannot erase runtime identity or an active media workspace.
 
-Run the live ACP-only smoke test when a working Grok CLI is available:
+Run the live ACP-only smoke test when a working agent CLI is available. It selects the provider from `AGENT_PROVIDER`:
 
 ```bash
 npm run smoke

@@ -120,8 +120,8 @@ export function createBridge(config: Config, factories: BridgeFactories = {}): B
   const allowedRootIdentities = new Map(
     config.cwdAllowlist.map((path) => [path, captureRootIdentity(path)] as const),
   );
-  let sessionRoot: RootIdentity = allowedRootIdentities.get(config.grokCwdAbs)
-    ?? captureRootIdentity(config.grokCwdAbs);
+  let sessionRoot: RootIdentity = allowedRootIdentities.get(config.agentCwdAbs)
+    ?? captureRootIdentity(config.agentCwdAbs);
   let acpExpectedRoot: RootIdentity = sessionRoot;
   const sessionIdForLock = `tg-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   acquireLock(config, sessionIdForLock);
@@ -169,7 +169,7 @@ export function createBridge(config: Config, factories: BridgeFactories = {}): B
   }
 
   function cwd(): string {
-    return acpHandle?.getCwd() ?? getSessionCwd(config.grokCwdAbs);
+    return acpHandle?.getCwd() ?? getSessionCwd(config.agentCwdAbs);
   }
 
   const reportHealth = (reason: string): void => {
@@ -273,7 +273,7 @@ export function createBridge(config: Config, factories: BridgeFactories = {}): B
       }
     },
     onPermissionRequest: async (req: PermissionRequest) => {
-      if (config.GROK_ALWAYS_APPROVE) {
+      if (config.agentAlwaysApprove) {
         const allow = (req.options || []).find((option) => option.kind === "allow_always")
           ?? (req.options || []).find((option) => option.kind === "allow_once");
         return {
@@ -350,14 +350,14 @@ export function createBridge(config: Config, factories: BridgeFactories = {}): B
       await acpClient.sendPrompt(finalBlocks.length === 1 ? finalBlocks[0]! : finalBlocks);
       await onPromptComplete(getCurrentAssistantText(), chatId, promptId);
     } catch (error: unknown) {
-      const correlationId = `grok-${Date.now().toString(36)}`;
-      console.error(`[${correlationId}] Grok prompt failed: ${sanitizedError(error)}`);
+      const correlationId = `agent-${Date.now().toString(36)}`;
+      console.error(`[${correlationId}] Agent prompt failed: ${sanitizedError(error)}`);
       const current = getActivePrompt();
       if (current?.id === promptId && !current.cancelling) {
         try {
           await sendMessage(
             chatId,
-            `Grok Build couldn't complete that request. Reference: ${correlationId}`,
+            `${config.agentDisplayName} couldn't complete that request. Reference: ${correlationId}`,
           );
         } catch (deliveryError: unknown) {
           console.error(`[${correlationId}] Error notice delivery failed: ${sanitizedError(deliveryError)}`);
@@ -799,7 +799,7 @@ export function createBridge(config: Config, factories: BridgeFactories = {}): B
   }
 
   async function start(): Promise<void> {
-    console.log("[BRIDGE] Starting Grok Build Telegram bridge...");
+    console.log(`[BRIDGE] Starting ${config.agentDisplayName} Telegram bridge...`);
     connected = true;
 
     try {

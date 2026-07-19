@@ -4,6 +4,7 @@ import {
   markdownToTelegramHtml,
   permissionKeyboard,
   permissionSelection,
+  pendingPermissionText,
   resolvedPermissionText,
   stalePromptKeyboard,
   describeTool,
@@ -23,8 +24,8 @@ import {
   resetRuntimeStateForTests,
   type AccessState,
 } from "./state.js";
-import { buildGrokChildEnv } from "./acp-client.js";
-import { parseEnvironment, resolveGrokBinary } from "./config.js";
+import { buildAgentChildEnv } from "./agent-launch.js";
+import { parseEnvironment, resolveAgentBinary } from "./config.js";
 import { assertRuntimePathsOutsideBuildOutput } from "./path-safety.js";
 import {
   buildPromptBlocks,
@@ -102,10 +103,10 @@ describe("Telegram permission rendering", () => {
     expect(permissionKeyboard("request-1", options)).toEqual({
       inline_keyboard: [
         [
-          { text: "✅ Allow once", callback_data: "grok:o:request-1:0" },
-          { text: "✅ Allow for session", callback_data: "grok:o:request-1:1" },
+          { text: "✅ Allow once", callback_data: "agent:o:request-1:0" },
+          { text: "✅ Allow for session", callback_data: "agent:o:request-1:1" },
         ],
-        [{ text: "❌ Reject once", callback_data: "grok:o:request-1:2" }],
+        [{ text: "❌ Reject once", callback_data: "agent:o:request-1:2" }],
       ],
     });
   });
@@ -125,6 +126,15 @@ describe("Telegram permission rendering", () => {
       "⌛ Approval expired",
     )).toBe("⌛ Approval expired\n\nRun tests\n\nNo action was approved.");
   });
+
+  it("renders permission prompts with a provider-neutral display name", () => {
+    expect(pendingPermissionText("Run npm test", "GitHub Copilot CLI"))
+      .toBe("⚠️ GitHub Copilot CLI needs approval\n\nRun npm test\n\nChoose an option below or reply approve/reject.");
+    expect(finalizeExistingPermissionText(
+      "⚠️ GitHub Copilot CLI needs approval\n\nRun npm test\n\nChoose an option below or reply approve/reject.",
+      "✅ Allowed once",
+    )).toBe("✅ Allowed once\n\nRun npm test\n\nDecision recorded.");
+  });
 });
 
 describe("redaction", () => {
@@ -143,14 +153,14 @@ describe("redaction", () => {
 
 describe("Grok subprocess environment", () => {
   it("disables Claude-compatible MCPs and hooks without leaking bridge secrets", () => {
-    const childEnv = buildGrokChildEnv({
+    const childEnv = buildAgentChildEnv({
       HOME: "/root",
       PATH: "/usr/bin",
       TELEGRAM_BOT_TOKEN: "telegram-secret",
       XAI_API_KEY: "xai-secret",
       GROK_CLAUDE_MCPS_ENABLED: "true",
       GROK_CLAUDE_HOOKS_ENABLED: "true",
-    });
+    }, "grok");
 
     expect(childEnv.HOME).toBe("/root");
     expect(childEnv.PATH).toBe("/usr/bin");
@@ -467,8 +477,8 @@ describe("prompt queue and stale keyboard", () => {
   it("exposes cancel/keep buttons for stalled prompts", () => {
     expect(stalePromptKeyboard("prompt-1")).toEqual({
       inline_keyboard: [[
-        { text: "Cancel", callback_data: "grok:s:prompt-1:cancel" },
-        { text: "Keep waiting", callback_data: "grok:s:prompt-1:keep" },
+        { text: "Cancel", callback_data: "agent:s:prompt-1:cancel" },
+        { text: "Keep waiting", callback_data: "agent:s:prompt-1:keep" },
       ]],
     });
   });
@@ -498,7 +508,7 @@ describe("public repository safety defaults", () => {
 
   it("resolves Grok from the current user's home without a root-specific path", () => {
     const checked: string[] = [];
-    const resolved = resolveGrokBinary("grok", "/home/example", (candidate) => {
+    const resolved = resolveAgentBinary("grok", "grok", "/home/example", (candidate) => {
       checked.push(candidate);
       return candidate === "/home/example/.grok/bin/grok";
     });
@@ -526,7 +536,7 @@ describe("public repository safety defaults", () => {
         safeState,
         join(buildOutput, "workspace"),
         buildOutput,
-      )).toThrow(/GROK_CWD/);
+      )).toThrow(/AGENT_CWD/);
       expect(() => assertRuntimePathsOutsideBuildOutput(
         join(buildAlias, "state"),
         safeCwd,

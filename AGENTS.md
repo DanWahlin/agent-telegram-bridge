@@ -4,7 +4,7 @@ Guidance for coding agents and contributors working in this repository.
 
 ## Project purpose
 
-This project is a security-sensitive bridge between one private Telegram owner and one local Grok Build ACP session. Preserve the single-owner, single-poller, single-active-prompt model unless a change explicitly redesigns and tests that model.
+This project is a security-sensitive bridge between one private Telegram owner and one local coding-agent ACP session. The agent provider is selectable (`AGENT_PROVIDER=grok|copilot`): Grok Build or GitHub Copilot CLI, both launched over ACP stdio. Preserve the single-owner, single-poller, single-active-prompt model unless a change explicitly redesigns and tests that model.
 
 ## Repository map
 
@@ -23,7 +23,8 @@ This project is a security-sensitive bridge between one private Telegram owner a
 | `src/telegram-stream.ts` | Assistant streaming drafts and final delivery |
 | `src/telegram-bubbles.ts` | Tool-progress bubble rendering |
 | `src/telegram-media.ts` | Inbound Telegram attachment download and extraction |
-| `src/acp-client.ts` | Grok subprocess and ACP session/permission client |
+| `src/acp-client.ts` | Agent subprocess and ACP session/permission client |
+| `src/agent-launch.ts` | Provider-neutral ACP launch spec and child-env construction (grok/copilot) |
 | `src/state.ts` | Pairing, authorization, locks, runtime state, and health snapshots |
 | `src/config.ts` | Environment parsing and runtime configuration |
 | `src/path-safety.ts` | Canonical path guards that keep runtime state and workspaces outside disposable build output |
@@ -38,9 +39,10 @@ This project is a security-sensitive bridge between one private Telegram owner a
 
 - Accept prompts, commands, callbacks, and permission decisions only from the paired owner in a private chat.
 - Keep permission decisions bound to the pending request, active user, and active chat.
-- Never pass `TELEGRAM_BOT_TOKEN` or unrelated parent-process secrets to the Grok subprocess. Environment filtering is not an OS sandbox; do not claim it prevents the child from reading files available to the same operating-system identity.
+- Never pass `TELEGRAM_BOT_TOKEN` or unrelated parent-process secrets to the agent subprocess. Environment filtering is not an OS sandbox; do not claim it prevents the child from reading files available to the same operating-system identity.
 - Never let build-cleaning commands remove runtime state, pairing identity, health files, or the active poller lock.
 - Launch subprocesses with `shell: false`; do not construct shell command strings from user input.
+- Build every agent launch through `buildAgentLaunch` in `src/agent-launch.ts`. Never pass `--model` to Copilot. Only the Grok child env forces `GROK_CLAUDE_MCPS_ENABLED=false` and `GROK_CLAUDE_HOOKS_ENABLED=false`.
 - Preserve atomic state writes, state-directory symlink refusal, `0700` directory mode, and `0600` file mode.
 - Preserve the one-poller ownership lock and verify ownership before refreshing or removing it.
 - Route Telegram API operations through the shared paced queue so ordering and rate-limit handling stay consistent.
@@ -71,7 +73,7 @@ npm run build
 npm audit
 ```
 
-Use `npm run smoke` only when a local, authenticated Grok CLI is available. It starts a real ACP subprocess.
+Use `npm run smoke` only when a local, authenticated agent CLI is available. It selects the provider from `AGENT_PROVIDER` and starts a real ACP subprocess.
 
 ## Coding conventions
 
@@ -124,7 +126,7 @@ Never commit:
 
 - `.env` or local environment variants
 - Telegram bot tokens or API credentials
-- `.grok-telegram-state/`
+- `.agent-telegram-state/`
 - `access.json`, `lock.json`, or `health.json`
 - Logs containing user prompts, agent output, permission payloads, or credentials
 

@@ -10,16 +10,24 @@ import {
 
 dotenv.config();
 
+export const AGENT_PROVIDERS = ["grok", "copilot"] as const;
+export type AgentProvider = (typeof AGENT_PROVIDERS)[number];
+
+const boolFromString = (v: string) => v === "true" || v === "1" || v === "yes";
+
 const EnvSchema = z.object({
   TELEGRAM_BOT_TOKEN: z.string().min(10, "TELEGRAM_BOT_TOKEN is required"),
-  GROK_CWD: z.string().default(process.cwd()),
-  GROK_BIN: z.string().default("grok"),
-  GROK_MODEL: z.string().default("grok-4.5"),
-  STATE_DIR: z.string().default(resolve(process.cwd(), ".grok-telegram-state")),
-  GROK_ALWAYS_APPROVE: z
+  AGENT_PROVIDER: z.enum(AGENT_PROVIDERS).default("grok"),
+  AGENT_CWD: z.string().default(process.cwd()),
+  AGENT_BIN: z.string().default(""),
+  AGENT_MODEL: z.string().default("grok-4.5"),
+  AGENT_DISPLAY_NAME: z.string().default(""),
+  STATE_DIR: z.string().default(resolve(process.cwd(), ".agent-telegram-state")),
+  AGENT_CWD_ALLOWLIST: z.string().default(""),
+  AGENT_ALWAYS_APPROVE: z
     .string()
     .default("false")
-    .transform((v) => v === "true" || v === "1" || v === "yes"),
+    .transform(boolFromString),
   // Timing controls (ms)
   PAIRING_EXPIRY_MS: z.coerce.number().int().positive().default(5 * 60 * 1000),
   PAIRING_PENDING_MAX: z.coerce.number().int().positive().max(1000).default(100),
@@ -53,31 +61,66 @@ const EnvSchema = z.object({
   WATCHDOG_INTERVAL_MS: z.coerce.number().int().positive().default(30_000),
   BUBBLE_DEBOUNCE_MS: z.coerce.number().int().positive().default(300),
   THOUGHT_EDIT_INTERVAL_MS: z.coerce.number().int().positive().default(2500),
-  GROK_CWD_ALLOWLIST: z.string().default(""),
   VERBOSE_DEFAULT: z
     .string()
     .default("false")
-    .transform((v) => v === "true" || v === "1" || v === "yes"),
+    .transform(boolFromString),
 });
+
+export const DEFAULT_DISPLAY_NAMES: Record<AgentProvider, string> = {
+  grok: "Grok Build",
+  copilot: "GitHub Copilot CLI",
+};
+
+export const DEFAULT_AGENT_BINS: Record<AgentProvider, string> = {
+  grok: "grok",
+  copilot: "/usr/bin/copilot",
+};
 
 export type Config = z.infer<typeof EnvSchema> & {
   stateDir: string;
-  grokCwdAbs: string;
-  grokBin: string;
+  agentProvider: AgentProvider;
+  agentCwdAbs: string;
+  agentBin: string;
+  agentModel: string;
+  agentAlwaysApprove: boolean;
+  agentDisplayName: string;
   mimeAllowlist: string[];
   cwdAllowlist: string[];
 };
 
-export function parseEnvironment(input: NodeJS.ProcessEnv) {
-  return EnvSchema.parse(input);
+/**
+ * Provider-neutral aliasing: first-class AGENT_* variables win, but the legacy
+ * GROK_* names remain accepted for Grok migration.
+ */
+function applyLegacyAliases(input: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const pick = (primary: string, legacy: string) =>
+    input[primary] ?? input[legacy];
+  return {
+    ...input,
+    AGENT_CWD: pick("AGENT_CWD", "GROK_CWD"),
+    AGENT_BIN: pick("AGENT_BIN", "GROK_BIN"),
+    AGENT_MODEL: pick("AGENT_MODEL", "GROK_MODEL"),
+    AGENT_ALWAYS_APPROVE: pick("AGENT_ALWAYS_APPROVE", "GROK_ALWAYS_APPROVE"),
+    AGENT_CWD_ALLOWLIST: pick("AGENT_CWD_ALLOWLIST", "GROK_CWD_ALLOWLIST"),
+  };
 }
 
-export function resolveGrokBinary(
+export function parseEnvironment(input: NodeJS.ProcessEnv) {
+  return EnvSchema.parse(applyLegacyAliases(input));
+}
+
+export function resolveAgentBinary(
+  provider: AgentProvider,
   configured: string,
   home: string | undefined,
   fileExists: (path: string) => boolean = existsSync,
 ): string {
-  if (configured && configured !== "grok") return configured;
+  const trimmed = configured.trim();
+  if (provider === "copilot") {
+    return trimmed || DEFAULT_AGENT_BINS.copilot;
+  }
+  if (trimmed && trimmed !== "grok") return trimmed;
   const candidates = [home ? `${home}/.grok/bin/grok` : null, "grok"]
     .filter(Boolean) as string[];
   return candidates.find((candidate) => candidate === "grok" || fileExists(candidate)) ?? "grok";
@@ -87,23 +130,25 @@ export function loadConfig(): Config {
   const parsed = parseEnvironment(process.env);
 
   const stateDir = resolve(parsed.STATE_DIR);
-  const grokCwdCandidate = resolve(parsed.GROK_CWD);
-  if (!existsSync(grokCwdCandidate) || !statSync(grokCwdCandidate).isDirectory()) {
-    throw new Error(`GROK_CWD must be an existing directory: ${grokCwdCandidate}`);
+  const agentCwdCandidate = resolve(parsed.AGENT_CWD);
+  if (!existsSync(agentCwdCandidate) || !statSync(agentCwdCandidate).isDirectory()) {
+    throw new Error(`AGENT_CWD must be an existing directory: ${agentCwdCandidate}`);
   }
-  const grokCwdAbs = realpathSync(grokCwdCandidate);
+  const agentCwdAbs = realpathSync(agentCwdCandidate);
   assertRuntimePathsOutsideBuildOutput(
     stateDir,
-    grokCwdAbs,
+    agentCwdAbs,
     getBuildOutputDir(import.meta.url),
   );
-  const grokBin = resolveGrokBinary(parsed.GROK_BIN, process.env["HOME"]);
+  const agentBin = resolveAgentBinary(parsed.AGENT_PROVIDER, parsed.AGENT_BIN, process.env["HOME"]);
+  const agentDisplayName = parsed.AGENT_DISPLAY_NAME.trim()
+    || DEFAULT_DISPLAY_NAMES[parsed.AGENT_PROVIDER];
 
   const cwdAllowlist = [...new Set(
-    parseCwdAllowlist(parsed.GROK_CWD_ALLOWLIST, grokCwdAbs).map((entry) => {
+    parseCwdAllowlist(parsed.AGENT_CWD_ALLOWLIST, agentCwdAbs).map((entry) => {
       const candidate = resolve(entry);
       if (!existsSync(candidate) || lstatSync(candidate).isSymbolicLink() || !statSync(candidate).isDirectory()) {
-        throw new Error(`GROK_CWD_ALLOWLIST entries must be existing non-symlink directories: ${candidate}`);
+        throw new Error(`AGENT_CWD_ALLOWLIST entries must be existing non-symlink directories: ${candidate}`);
       }
       return realpathSync(candidate);
     }),
@@ -112,8 +157,12 @@ export function loadConfig(): Config {
   return {
     ...parsed,
     stateDir,
-    grokCwdAbs,
-    grokBin,
+    agentProvider: parsed.AGENT_PROVIDER,
+    agentCwdAbs,
+    agentBin,
+    agentModel: parsed.AGENT_MODEL,
+    agentAlwaysApprove: parsed.AGENT_ALWAYS_APPROVE,
+    agentDisplayName,
     mimeAllowlist: parseMimeAllowlist(parsed.MEDIA_MIME_ALLOWLIST),
     cwdAllowlist,
   };

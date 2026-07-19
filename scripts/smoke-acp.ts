@@ -2,22 +2,27 @@ import { spawn } from "node:child_process";
 import { resolve } from "node:path";
 import { Readable, Writable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk";
-import { buildGrokChildEnv } from "../src/acp-client.js";
-import { resolveGrokBinary } from "../src/config.js";
+import { buildAgentLaunch } from "../src/agent-launch.js";
+import { parseEnvironment, resolveAgentBinary, DEFAULT_DISPLAY_NAMES, type Config } from "../src/config.js";
 
-const grok = resolveGrokBinary(process.env["GROK_BIN"] ?? "grok", process.env["HOME"]);
-const model = process.env["GROK_MODEL"] ?? "grok-4.5";
-const sessionCwd = resolve(process.env["GROK_CWD"] ?? "/tmp");
-const alwaysApprove = ["true", "1", "yes"].includes(
-  (process.env["GROK_ALWAYS_APPROVE"] ?? "false").toLowerCase(),
-);
-const args = ["agent", "--model", model];
-if (alwaysApprove) args.push("--always-approve");
-args.push("stdio");
-const child = spawn(grok, args, {
+const parsed = parseEnvironment(process.env);
+const sessionCwd = resolve(parsed.AGENT_CWD);
+const agentBin = resolveAgentBinary(parsed.AGENT_PROVIDER, parsed.AGENT_BIN, process.env["HOME"]);
+
+// Minimal Config projection sufficient for the launch builder.
+const smokeConfig = {
+  agentProvider: parsed.AGENT_PROVIDER,
+  agentBin,
+  agentModel: parsed.AGENT_MODEL,
+  agentAlwaysApprove: parsed.AGENT_ALWAYS_APPROVE,
+  agentDisplayName: parsed.AGENT_DISPLAY_NAME.trim() || DEFAULT_DISPLAY_NAMES[parsed.AGENT_PROVIDER],
+} as Config;
+
+const launch = buildAgentLaunch(smokeConfig, sessionCwd);
+const child = spawn(launch.command, launch.args, {
   cwd: sessionCwd,
   stdio: ["pipe", "pipe", "inherit"],
-  env: buildGrokChildEnv(process.env),
+  env: launch.env,
   shell: false,
 });
 const timeout = setTimeout(() => {
@@ -32,7 +37,7 @@ const stream = acp.ndJsonStream(
   Readable.toWeb(child.stdout!),
 );
 const app = acp
-  .client({ name: "grok-build-telegram-smoke" })
+  .client({ name: "agent-telegram-bridge-smoke" })
   .onRequest(acp.methods.client.session.requestPermission, ({ params }) => {
     const option = params.options.find((item) => item.kind === "allow_once")
       ?? params.options.find((item) => item.kind === "allow_always");
@@ -45,7 +50,7 @@ try {
     const init = await context.request(acp.methods.agent.initialize, {
       protocolVersion: acp.PROTOCOL_VERSION,
       clientCapabilities: {},
-      clientInfo: { name: "grok-build-telegram-smoke", version: "0.1.0" },
+      clientInfo: { name: "agent-telegram-bridge-smoke", version: "0.1.0" },
     });
     if (init.protocolVersion !== acp.PROTOCOL_VERSION) throw new Error("ACP protocol mismatch");
     const session = await context.buildSession(sessionCwd).start();
