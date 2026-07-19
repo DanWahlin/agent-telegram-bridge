@@ -1,5 +1,9 @@
 # Agent Telegram Bridge
 
+<p align="center">
+  <img src="images/logo.webp" alt="Agent Telegram Bridge logo" width="400">
+</p>
+
 Run a local coding-agent session from a private Telegram chat. The bridge speaks the official [Agent Client Protocol (ACP)](https://agentclientprotocol.com) over stdio and supports two providers, selected with `AGENT_PROVIDER`:
 
 - **`grok`** — xAI Grok Build via `grok agent --model grok-4.5 stdio`
