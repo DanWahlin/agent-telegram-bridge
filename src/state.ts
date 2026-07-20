@@ -13,7 +13,6 @@ import { z, type ZodType } from "zod";
 import type { PermissionOption, RequestPermissionResponse } from "@agentclientprotocol/sdk";
 import type { Config } from "./config.js";
 import type { InboxFile } from "./media.js";
-import { getProcessStartToken } from "./platform-security.js";
 import { nowIso, parseTimeMs, ageMs, messageSafeRandom } from "./utils.js";
 import { sanitizedError, sanitizePermissionText } from "./redact.js";
 
@@ -235,19 +234,29 @@ export function completePairing(
 
 // --- Lock management ---
 
+function getProcessStartToken(pid: number): string | null {
+  if (platform() !== "linux") return null;
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf-8");
+    const lastParen = stat.lastIndexOf(")");
+    if (lastParen === -1) return null;
+    const fields = stat.slice(lastParen + 2).trim().split(/\s+/);
+    const startTime = fields[19];
+    return startTime ? `linux:${startTime}` : null;
+  } catch {
+    return null;
+  }
+}
+
 export function createLockData(
   sessionId: string,
   connectedAt = nowIso()
 ): LockData {
-  const processStartToken = getProcessStartToken(process.pid);
-  if (!processStartToken) {
-    throw new Error(`Could not prove process start identity on ${platform()}`);
-  }
   return {
     pid: process.pid,
     sessionId,
     hostname: hostname(),
-    processStartToken,
+    processStartToken: getProcessStartToken(process.pid),
     processStartTokenSource: platform(),
     connectedAt,
     updatedAt: nowIso(),
@@ -286,7 +295,7 @@ export function lockOwnedByCurrentProcess(lock: LockData | null, sessionId: stri
   if (lock.hostname && lock.hostname !== hostname()) return false;
   if (lock.processStartToken) {
     const current = getProcessStartToken(lock.pid);
-    if (!current || current !== lock.processStartToken) return false;
+    if (current && current !== lock.processStartToken) return false;
   }
   return true;
 }
@@ -325,7 +334,7 @@ export function isLockStale(config: Config, lock: LockData | null): boolean {
   }
   if (lock && lock.processStartToken) {
     const current = getProcessStartToken(lock.pid);
-    if (!current || current !== lock.processStartToken) return true;
+    if (current && current !== lock.processStartToken) return true;
   }
   return false;
 }

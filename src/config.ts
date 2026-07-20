@@ -1,7 +1,6 @@
 import { z } from "zod";
 import { resolve } from "node:path";
 import { existsSync, lstatSync, realpathSync, statSync } from "node:fs";
-import { platform } from "node:os";
 import dotenv from "dotenv";
 import { parseCwdAllowlist, parseMimeAllowlist } from "./media.js";
 import {
@@ -116,11 +115,10 @@ export function resolveAgentBinary(
   configured: string,
   home: string | undefined,
   fileExists: (path: string) => boolean = existsSync,
-  hostPlatform: NodeJS.Platform = platform(),
 ): string {
   const trimmed = configured.trim();
   if (provider === "copilot") {
-    return trimmed || (hostPlatform === "darwin" ? "copilot" : DEFAULT_AGENT_BINS.copilot);
+    return trimmed || DEFAULT_AGENT_BINS.copilot;
   }
   if (trimmed && trimmed !== "grok") return trimmed;
   const candidates = [home ? `${home}/.grok/bin/grok` : null, "grok"]

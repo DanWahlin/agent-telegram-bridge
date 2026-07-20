@@ -28,7 +28,6 @@ This project is a security-sensitive bridge between one private Telegram owner a
 | `src/state.ts` | Pairing, authorization, locks, runtime state, and health snapshots |
 | `src/config.ts` | Environment parsing and runtime configuration |
 | `src/path-safety.ts` | Canonical path guards that keep runtime state and workspaces outside disposable build output |
-| `src/platform-security.ts` | Linux/macOS process-start and child-CWD identity adapters; native Windows rejection |
 | `src/redact.ts` | Sanitization for logs and permission text |
 | `src/utils.ts` | Small shared time and random-value helpers |
 | `src/media.ts` | Attachment MIME/root helpers, inbox files, and ACP content blocks |
@@ -37,8 +36,6 @@ This project is a security-sensitive bridge between one private Telegram owner a
 | `scripts/smoke-acp.ts` | Live ACP smoke test without Telegram |
 | `deploy/systemd/agent-telegram@.service` | Shared systemd instance template for one provider/bot per service |
 | `deploy/systemd/copilot.env.example` | Redacted production-style Copilot instance configuration |
-| `deploy/launchd/run-agent-telegram.sh` | Owner-only environment loader and Node launcher for macOS |
-| `deploy/launchd/*.example` | Redacted macOS LaunchAgent and instance environment templates |
 
 ## Current production deployment
 
@@ -72,7 +69,6 @@ Never add `--model` for Copilot. Never print or commit `/etc/agent-telegram/copi
 - Build every agent launch through `buildAgentLaunch` in `src/agent-launch.ts`. Never pass `--model` to Copilot. Only the Grok child env forces `GROK_CLAUDE_MCPS_ENABLED=false` and `GROK_CLAUDE_HOOKS_ENABLED=false`.
 - Preserve atomic state writes, state-directory symlink refusal, `0700` directory mode, and `0600` file mode.
 - Preserve the one-poller ownership lock and verify ownership before refreshing or removing it.
-- Keep Linux and macOS identity checks fail-closed. Linux uses `/proc`; macOS uses fixed-argument `/usr/sbin/lsof` and `/bin/ps` calls with no shell. Native Windows must direct users to WSL2.
 - After every completed or failed prompt, persist a fresh health snapshot after clearing prompt ownership. A healthy completed turn has `activePrompt: null`, `reason: prompt-idle`, and `likelyState: healthy/idle`; do not infer a live hang from a stale snapshot.
 - Route Telegram API operations through the shared paced queue so ordering and rate-limit handling stay consistent.
 - Escape agent output before Telegram HTML rendering and allow only explicitly supported link schemes.
@@ -80,7 +76,6 @@ Never add `--model` for Copilot. Never print or commit `/etc/agent-telegram/copi
 - Do not silently swallow failures in required delivery or permission paths. Cleanup may be best effort, but failures should be safely logged.
 - Keep automatic tool approval disabled by default.
 - Media ingress: owner + private chat before download; MIME allowlist + size cap; inbox under session CWD with owner-only perms; after the prompt, erase and permission-lock the exact admitted opened file before closing its descriptor. Do not unlink a reusable pathname during live cleanup; empty placeholders may remain until offline maintenance.
-- On macOS, revalidate the admitted real path against the retained descriptor before exposing a `file://` URI. Image, audio, and embedded resource bytes must come from the retained descriptor, never a reopened pathname.
 - Keep automatic outbound local-file delivery disabled until ACP exposes a narrow, typed artifact contract.
 - Serialize ACP prompts (one in flight). Telegram-side queue is allowed; do not open a second ACP prompt concurrently.
 - `/cwd` may only switch to paths in the configured allowlist.
@@ -127,7 +122,6 @@ Use `npm run smoke` only when a local, authenticated agent CLI is available. It 
 - Use `src/test-support.ts` for complete test configuration instead of scattered partial `Config` casts.
 - Every security fix or externally visible behavior change needs a focused regression test.
 - Tests must not call the real Telegram API or require live credentials.
-- Platform adapter tests may inject macOS command output on Linux, but that is not a substitute for a real Apple Silicon or Intel macOS smoke test.
 
 ## Change checklist
 
@@ -152,9 +146,8 @@ When changing state or configuration:
 
 When changing deployment or provider launch behavior:
 
-- Keep `deploy/systemd/agent-telegram@.service`, `deploy/launchd/`, their environment examples, and the README commands aligned with production.
+- Keep `deploy/systemd/agent-telegram@.service`, its environment examples, and the README commands aligned with production.
 - Validate the unit with `systemd-analyze verify` and compare the checked-in template with the installed unit when working on this host.
-- Validate LaunchAgent templates with `plutil -lint` on macOS and keep secrets out of plist files.
 - Prove exactly one poller owns each bot token before and after a cutover.
 - Verify the exact child argv from the live systemd cgroup. Copilot must have no `--model`; Grok model selection remains explicit configuration.
 - Preserve a tested rollback path before disabling or replacing a production instance.

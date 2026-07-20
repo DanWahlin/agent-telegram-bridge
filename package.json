@@ -38,10 +38,6 @@
   "engines": {
     "node": ">=24.0.0"
   },
-  "os": [
-    "linux",
-    "darwin"
-  ],
   "files": [
     "dist",
     "deploy",

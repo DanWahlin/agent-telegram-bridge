@@ -2,12 +2,10 @@
 import { loadConfig } from "./config.js";
 import { createBridge } from "./bridge.js";
 import { sanitizedError } from "./redact.js";
-import { normalizeSupportedPlatform } from "./platform-security.js";
 
 async function main() {
-  const hostPlatform = normalizeSupportedPlatform();
   const config = loadConfig();
-  console.log("[AGENT-TG] Config loaded. PLATFORM=", hostPlatform, "PROVIDER=", config.agentProvider, "STATE_DIR=", config.stateDir, "AGENT_CWD=", config.agentCwdAbs, "ALWAYS_APPROVE=", config.agentAlwaysApprove);
+  console.log("[AGENT-TG] Config loaded. PROVIDER=", config.agentProvider, "STATE_DIR=", config.stateDir, "AGENT_CWD=", config.agentCwdAbs, "ALWAYS_APPROVE=", config.agentAlwaysApprove);
 
   const bridge = createBridge(config);
 

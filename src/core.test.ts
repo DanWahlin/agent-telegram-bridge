@@ -396,8 +396,7 @@ describe("media and prompt blocks", () => {
     }
   });
 
-  it("keeps Linux fallback resource links bound to the admitted file descriptor", () => {
-    if (process.platform !== "linux") return;
+  it("keeps fallback resource links bound to the admitted file descriptor", () => {
     const dir = mkdtempSync(join(tmpdir(), "grok-tg-descriptor-link-"));
     const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     try {
@@ -413,53 +412,6 @@ describe("media and prompt blocks", () => {
 
       cleanupInboxFiles([file]);
       expect(() => readFileSync(descriptorPath)).toThrow();
-    } finally {
-      warning.mockRestore();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("builds macOS embedded resources from a retained and revalidated file", () => {
-    const dir = mkdtempSync(join(tmpdir(), "agent-tg-darwin-resource-"));
-    try {
-      const file = writeInboxFile(
-        captureRootIdentity(dir),
-        "note.txt",
-        Buffer.from("trusted"),
-        "darwin",
-      );
-      const { blocks } = buildPromptBlocks({
-        text: "inspect",
-        files: [file],
-        capabilities: { embeddedContext: true },
-      });
-      const resource = blocks.find((block) => block.type === "resource");
-      expect(resource?.type).toBe("resource");
-      if (!resource || resource.type !== "resource") throw new Error("resource missing");
-      expect(new URL(resource.resource.uri).pathname).toBe(file.path);
-      expect("text" in resource.resource ? resource.resource.text : null).toBe("trusted");
-      cleanupInboxFiles([file]);
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("rejects a swapped macOS attachment path before exposing it to ACP", () => {
-    const dir = mkdtempSync(join(tmpdir(), "agent-tg-darwin-swap-"));
-    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
-    try {
-      const file = writeInboxFile(
-        captureRootIdentity(dir),
-        "note.txt",
-        Buffer.from("trusted"),
-        "darwin",
-      );
-      renameSync(file.path, `${file.path}.retired`);
-      writeFileSync(file.path, "replacement");
-      expect(() => buildPromptBlocks({ text: "inspect", files: [file], capabilities: {} }))
-        .toThrow(/path identity changed/);
-      cleanupInboxFiles([file]);
-      expect(readFileSync(file.path, "utf8")).toBe("replacement");
     } finally {
       warning.mockRestore();
       rmSync(dir, { recursive: true, force: true });
@@ -562,11 +514,6 @@ describe("public repository safety defaults", () => {
     });
     expect(resolved).toBe("/home/example/.grok/bin/grok");
     expect(checked).not.toContain("/root/.grok/bin/grok");
-  });
-
-  it("uses PATH to resolve Copilot on macOS", () => {
-    expect(resolveAgentBinary("copilot", "", "/Users/example", () => false, "darwin"))
-      .toBe("copilot");
   });
 
   it("rejects runtime state or agent workspaces inside build output", () => {

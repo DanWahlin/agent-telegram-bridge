@@ -333,7 +333,7 @@ describe("ACP process ownership", () => {
   });
 
   it("proves the spawned process is running in the authorized directory identity", async () => {
-    if (process.platform !== "linux" && process.platform !== "darwin") return;
+    if (process.platform !== "linux") return;
     const parent = mkdtempSync(join(tmpdir(), "grok-tg-process-cwd-"));
     const allowed = join(parent, "allowed");
     const other = join(parent, "other");
