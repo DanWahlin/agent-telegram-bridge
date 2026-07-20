@@ -20,6 +20,7 @@ import {
   startTyping,
   stopPolling,
   trackToolCall,
+  updateToolCall,
 } from "./telegram.js";
 import {
   clearActivePrompt,
@@ -264,7 +265,7 @@ describe("Telegram delivery runtime", () => {
 
     trackToolCall("tool-1", "Run command", { command: "npm test" });
     await vi.advanceTimersByTimeAsync(300);
-    trackToolCall("tool-1", "Run command", { command: "npm test" });
+    updateToolCall("tool-1", "completed");
     await vi.advanceTimersByTimeAsync(300);
     await dismissBubble();
 
