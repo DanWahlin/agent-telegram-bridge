@@ -13,10 +13,12 @@ import {
   constants,
 } from "node:fs";
 import { basename, extname, join, resolve } from "node:path";
+import { platform } from "node:os";
 import { createHash } from "node:crypto";
 import type { ContentBlock } from "@agentclientprotocol/sdk";
 import { sanitizedError } from "./redact.js";
 import { messageSafeRandom } from "./utils.js";
+import { normalizeSupportedPlatform, type SupportedHostPlatform } from "./platform-security.js";
 
 export interface PromptCapabilities {
   image?: boolean;
@@ -25,6 +27,7 @@ export interface PromptCapabilities {
 }
 
 export interface InboxFile {
+  transport: "linux-proc-fd" | "darwin-inline";
   path: string;
   name: string;
   mime: string;
@@ -39,6 +42,8 @@ export interface InboxFile {
   fileIno: bigint;
   sha256: string;
   descriptorFd: number | null;
+  inlineData: Buffer | null;
+  hostPlatform: SupportedHostPlatform;
 }
 
 export interface RootIdentity {
@@ -214,7 +219,14 @@ function writeInboxGitignore(handle: InboxDirectoryHandle): void {
   }
 }
 
-export function ensureInboxDir(root: RootIdentity): string {
+export function ensureInboxDir(
+  root: RootIdentity,
+  hostPlatformInput: NodeJS.Platform = platform(),
+): string {
+  if (normalizeSupportedPlatform(hostPlatformInput) === "darwin") {
+    validateRootIdentity(root);
+    return root.path;
+  }
   const handle = openInboxDirectory(root);
   try {
     writeInboxGitignore(handle);
@@ -231,6 +243,9 @@ export function safeInboxFileName(originalName: string): string {
 }
 
 function readInboxFile(file: InboxFile): Buffer {
+  if (file.transport !== "linux-proc-fd") {
+    throw new Error("Disk inbox reads require the Linux descriptor transport");
+  }
   const root: RootIdentity = { path: file.rootPath, dev: file.rootDev, ino: file.rootIno };
   const handle = openInboxDirectory(root);
   try {
@@ -260,6 +275,17 @@ function readInboxFile(file: InboxFile): Buffer {
   }
 }
 
+function readInlineFile(file: InboxFile): Buffer {
+  const root: RootIdentity = { path: file.rootPath, dev: file.rootDev, ino: file.rootIno };
+  validateRootIdentity(root);
+  const data = file.inlineData;
+  if (!data || data.length !== file.size
+    || createHash("sha256").update(data).digest("hex") !== file.sha256) {
+    throw new Error("Inline attachment identity changed after admission");
+  }
+  return Buffer.from(data);
+}
+
 export function buildPromptBlocks(options: {
   text: string;
   files: InboxFile[];
@@ -273,6 +299,30 @@ export function buildPromptBlocks(options: {
   blocks.push({ type: "text", text });
 
   for (const file of options.files) {
+    if (file.transport === "darwin-inline") {
+      const buf = readInlineFile(file);
+      const b64 = buf.toString("base64");
+      const uri = `urn:agent-telegram:sha256:${file.sha256}`;
+      if (isImageMime(file.mime) && options.capabilities.image) {
+        blocks.push({ type: "image", data: b64, mimeType: file.mime, uri });
+        notes.push(`Attached image: ${file.originalName}`);
+      } else if (isAudioMime(file.mime) && options.capabilities.audio) {
+        blocks.push({ type: "audio", data: b64, mimeType: file.mime });
+        notes.push(`Attached audio: ${file.originalName}`);
+      } else if (options.capabilities.embeddedContext) {
+        const resource = file.mime.startsWith("text/") || file.mime === "application/json"
+          ? { uri, mimeType: file.mime, text: buf.toString("utf8").slice(0, 200_000) }
+          : { uri, mimeType: file.mime, blob: b64 };
+        blocks.push({ type: "resource", resource });
+        notes.push(`Embedded resource: ${file.originalName}`);
+      } else {
+        throw new Error(
+          `The connected agent does not support secure inline ${file.mime} attachments on macOS`,
+        );
+      }
+      continue;
+    }
+
     const buf = readInboxFile(file);
     const descriptorPath = file.descriptorFd === null
       ? null
@@ -330,10 +380,9 @@ export function buildPromptBlocks(options: {
   }
 
   if (notes.length && options.files.length) {
-    // Reinforce paths for agents that ignore resource links
     blocks.push({
       type: "text",
-      text: `Attachment paths on disk:\n${notes.map((n) => `- ${n}`).join("\n")}`,
+      text: `Attachment details:\n${notes.map((n) => `- ${n}`).join("\n")}`,
     });
   }
 
@@ -342,6 +391,11 @@ export function buildPromptBlocks(options: {
 
 export function cleanupInboxFiles(files: InboxFile[]): void {
   for (const file of files) {
+    if (file.transport === "darwin-inline") {
+      file.inlineData?.fill(0);
+      file.inlineData = null;
+      continue;
+    }
     const descriptorFd = file.descriptorFd;
     file.descriptorFd = null;
     if (descriptorFd === null) continue;
@@ -372,7 +426,36 @@ export function writeInboxFile(
   root: RootIdentity,
   originalName: string,
   data: Buffer,
+  hostPlatformInput: NodeJS.Platform = platform(),
 ): InboxFile {
+  const hostPlatform = normalizeSupportedPlatform(hostPlatformInput);
+  if (hostPlatform === "darwin") {
+    validateRootIdentity(root);
+    const inlineData = Buffer.from(data);
+    const name = safeInboxFileName(originalName);
+    const result: InboxFile = {
+      transport: "darwin-inline",
+      path: "",
+      name,
+      mime: guessMime(originalName),
+      originalName: basename(originalName || name),
+      size: inlineData.length,
+      rootPath: root.path,
+      rootDev: root.dev,
+      rootIno: root.ino,
+      inboxDev: 0n,
+      inboxIno: 0n,
+      fileDev: 0n,
+      fileIno: 0n,
+      sha256: createHash("sha256").update(inlineData).digest("hex"),
+      descriptorFd: null,
+      inlineData,
+      hostPlatform,
+    };
+    validateRootIdentity(root);
+    return result;
+  }
+
   const handle = openInboxDirectory(root);
   const name = safeInboxFileName(originalName);
   const descriptorPath = join(handle.descriptorPath, name);
@@ -395,6 +478,7 @@ export function writeInboxFile(
     validateRootIdentity(root);
     const mime = guessMime(originalName);
     const result: InboxFile = {
+      transport: "linux-proc-fd",
       path,
       name,
       mime,
@@ -409,6 +493,8 @@ export function writeInboxFile(
       fileIno: opened.ino,
       sha256: createHash("sha256").update(data).digest("hex"),
       descriptorFd: fd,
+      inlineData: null,
+      hostPlatform,
     };
     retained = true;
     return result;

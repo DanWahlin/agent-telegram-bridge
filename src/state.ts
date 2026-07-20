@@ -13,12 +13,25 @@ import { z, type ZodType } from "zod";
 import type { PermissionOption, RequestPermissionResponse } from "@agentclientprotocol/sdk";
 import type { Config } from "./config.js";
 import type { InboxFile } from "./media.js";
-import { nowIso, parseTimeMs, ageMs, messageSafeRandom } from "./utils.js";
+import {
+  acquireOwnershipLock,
+  getProcessStartToken,
+  releaseOwnershipLock,
+} from "./platform-security.js";
+import { nowIso, ageMs, messageSafeRandom } from "./utils.js";
 import { sanitizedError, sanitizePermissionText } from "./redact.js";
 
 export interface AccessState {
   allowedUsers: string[];
   pending: Record<string, { code: string; timestamp: number; attempts?: number | undefined }>;
+  notificationTarget?: { chatId: string; userId: string } | undefined;
+}
+
+export type LifecycleNotificationKind = "ready" | "disconnected";
+
+interface LifecycleNotificationState {
+  readyAt: number | null;
+  disconnectedAt: number | null;
 }
 
 export interface LockData {
@@ -87,7 +100,20 @@ const PendingPairingSchema = z.object({
 const AccessStateSchema: ZodType<AccessState> = z.object({
   allowedUsers: z.array(z.string()),
   pending: z.record(z.string(), PendingPairingSchema),
+  notificationTarget: z.object({
+    chatId: z.string(),
+    userId: z.string(),
+  }).optional(),
 });
+const LifecycleNotificationStateSchema: ZodType<LifecycleNotificationState> = z.object({
+  readyAt: z.number().finite().nullable(),
+  disconnectedAt: z.number().finite().nullable(),
+});
+const DEFAULT_LIFECYCLE_NOTIFICATIONS: LifecycleNotificationState = {
+  readyAt: null,
+  disconnectedAt: null,
+};
+const LIFECYCLE_NOTIFICATION_MIN_INTERVAL_MS = 60_000;
 const LockDataSchema: ZodType<LockData> = z.object({
   pid: z.number().int().positive(),
   sessionId: z.string().min(1),
@@ -159,6 +185,9 @@ export function lockPath(config: Config): string {
 export function healthPath(config: Config): string {
   return join(config.stateDir, "health.json");
 }
+function lifecycleNotificationsPath(config: Config): string {
+  return join(config.stateDir, "lifecycle-notifications.json");
+}
 
 export function reloadAccess(config: Config): AccessState {
   return loadJsonOrDefault(accessPath(config), DEFAULT_ACCESS, AccessStateSchema);
@@ -170,6 +199,69 @@ export function saveAccess(config: Config, access: AccessState): void {
 
 export function isAllowed(access: AccessState, userId: number | string): boolean {
   return access.allowedUsers.includes(String(userId));
+}
+
+export function rememberAuthorizedPrivateChat(
+  config: Config,
+  access: AccessState,
+  chatId: number | string,
+  userId: number | string,
+): boolean {
+  const chatIdStr = String(chatId);
+  const userIdStr = String(userId);
+  if (!isAllowed(access, userIdStr)) return false;
+  const chatIdNumber = Number(chatIdStr);
+  const userIdNumber = Number(userIdStr);
+  if (!Number.isSafeInteger(chatIdNumber) || chatIdNumber <= 0
+    || !Number.isSafeInteger(userIdNumber) || userIdNumber <= 0
+    || chatIdNumber !== userIdNumber) return false;
+  if (access.notificationTarget?.chatId === chatIdStr
+    && access.notificationTarget.userId === userIdStr) return true;
+  access.notificationTarget = { chatId: chatIdStr, userId: userIdStr };
+  saveAccess(config, access);
+  return true;
+}
+
+export function getAuthorizedNotificationChatId(config: Config): number | null {
+  const access = reloadAccess(config);
+  const target = access.notificationTarget;
+  if (!target || !isAllowed(access, target.userId)) return null;
+  const chatId = Number(target.chatId);
+  const userId = Number(target.userId);
+  return Number.isSafeInteger(chatId) && chatId > 0
+    && Number.isSafeInteger(userId) && userId > 0
+    && chatId === userId
+    ? chatId
+    : null;
+}
+
+export function lifecycleNotificationDue(
+  config: Config,
+  kind: LifecycleNotificationKind,
+  now = Date.now(),
+): boolean {
+  const state = loadJsonOrDefault(
+    lifecycleNotificationsPath(config),
+    DEFAULT_LIFECYCLE_NOTIFICATIONS,
+    LifecycleNotificationStateSchema,
+  );
+  const last = kind === "ready" ? state.readyAt : state.disconnectedAt;
+  return last == null || now - last >= LIFECYCLE_NOTIFICATION_MIN_INTERVAL_MS;
+}
+
+export function markLifecycleNotification(
+  config: Config,
+  kind: LifecycleNotificationKind,
+  now = Date.now(),
+): void {
+  const state = loadJsonOrDefault(
+    lifecycleNotificationsPath(config),
+    DEFAULT_LIFECYCLE_NOTIFICATIONS,
+    LifecycleNotificationStateSchema,
+  );
+  if (kind === "ready") state.readyAt = now;
+  else state.disconnectedAt = now;
+  saveJsonAtomic(lifecycleNotificationsPath(config), state, 0o600);
 }
 
 export function cleanExpiredPending(config: Config, access: AccessState): boolean {
@@ -211,6 +303,7 @@ export function completePairing(
 ): boolean {
   const chatIdStr = String(chatId);
   const userIdStr = String(userId);
+  if (chatIdStr !== userIdStr) return false;
   const pending = access.pending?.[chatIdStr];
   if (!pending) return false;
   if (Date.now() - pending.timestamp > config.PAIRING_EXPIRY_MS) {
@@ -227,6 +320,7 @@ export function completePairing(
   if (!access.allowedUsers.includes(userIdStr)) {
     access.allowedUsers.push(userIdStr);
   }
+  access.notificationTarget = { chatId: chatIdStr, userId: userIdStr };
   delete access.pending[chatIdStr];
   saveAccess(config, access);
   return true;
@@ -234,29 +328,30 @@ export function completePairing(
 
 // --- Lock management ---
 
-function getProcessStartToken(pid: number): string | null {
-  if (platform() !== "linux") return null;
-  try {
-    const stat = readFileSync(`/proc/${pid}/stat`, "utf-8");
-    const lastParen = stat.lastIndexOf(")");
-    if (lastParen === -1) return null;
-    const fields = stat.slice(lastParen + 2).trim().split(/\s+/);
-    const startTime = fields[19];
-    return startTime ? `linux:${startTime}` : null;
-  } catch {
-    return null;
-  }
+interface OwnershipLease {
+  token: bigint;
+  sessionId: string;
+}
+
+const ownershipLeases = new Map<string, OwnershipLease>();
+
+function ownershipLockPath(config: Config): string {
+  return `${lockPath(config)}.ownership`;
 }
 
 export function createLockData(
   sessionId: string,
   connectedAt = nowIso()
 ): LockData {
+  const processStartToken = getProcessStartToken(process.pid);
+  if (!processStartToken) {
+    throw new Error(`Could not prove process start identity on ${platform()}`);
+  }
   return {
     pid: process.pid,
     sessionId,
     hostname: hostname(),
-    processStartToken: getProcessStartToken(process.pid),
+    processStartToken,
     processStartTokenSource: platform(),
     connectedAt,
     updatedAt: nowIso(),
@@ -266,20 +361,34 @@ export function createLockData(
 export function acquireLock(config: Config, sessionId: string): void {
   const path = lockPath(config);
   const data = createLockData(sessionId);
+  if (ownershipLeases.has(path)) {
+    throw new Error("Bot is already locked by this process");
+  }
+  let token: bigint;
   try {
-    writeFileSync(path, JSON.stringify(data, null, 2) + "\n", { mode: 0o600, flag: "wx" });
-    chmodSync(path, 0o600);
-    return;
+    token = acquireOwnershipLock(ownershipLockPath(config));
   } catch (error: unknown) {
-    if (!isErrnoException(error) || error.code !== "EEXIST") throw error;
+    const code = error && typeof error === "object" && "code" in error
+      ? String((error as { code?: unknown }).code)
+      : "";
+    if (code === "OWNERSHIP_LOCK_HELD") {
+      const existing = readLock(config);
+      const owner = existing
+        ? ` by pid ${existing.pid} on ${existing.hostname}`
+        : "";
+      throw new Error(`Bot is already locked${owner}: ${sanitizedError(error)}`);
+    }
+    throw new Error(`Could not acquire bot ownership lock: ${sanitizedError(error)}`);
   }
-  const existing = readLock(config);
-  if (existing && !isLockStale(config, existing)) {
-    throw new Error(`Bot is already locked by pid ${existing.pid} on ${existing.hostname}`);
+  const lease: OwnershipLease = { token, sessionId };
+  ownershipLeases.set(path, lease);
+  try {
+    saveJsonAtomic(path, data, 0o600);
+  } catch (error: unknown) {
+    ownershipLeases.delete(path);
+    releaseOwnershipLock(lease.token);
+    throw error;
   }
-  rmSync(path, { force: true });
-  writeFileSync(path, JSON.stringify(data, null, 2) + "\n", { mode: 0o600, flag: "wx" });
-  chmodSync(path, 0o600);
 }
 
 export function readLock(config: Config): LockData | null {
@@ -295,12 +404,14 @@ export function lockOwnedByCurrentProcess(lock: LockData | null, sessionId: stri
   if (lock.hostname && lock.hostname !== hostname()) return false;
   if (lock.processStartToken) {
     const current = getProcessStartToken(lock.pid);
-    if (current && current !== lock.processStartToken) return false;
+    if (!current || current !== lock.processStartToken) return false;
   }
   return true;
 }
 
 export function refreshLock(config: Config, sessionId: string): boolean {
+  const lease = ownershipLeases.get(lockPath(config));
+  if (!lease || lease.sessionId !== sessionId) return false;
   const lock = readLock(config);
   if (!lock || !lockOwnedByCurrentProcess(lock, sessionId)) return false;
   const connectedAt = lock.connectedAt || nowIso();
@@ -309,34 +420,24 @@ export function refreshLock(config: Config, sessionId: string): boolean {
 }
 
 export function removeLock(config: Config, sessionId: string): void {
+  const path = lockPath(config);
+  const lease = ownershipLeases.get(path);
+  if (!lease || lease.sessionId !== sessionId) return;
   const lock = readLock(config);
-  if (lockOwnedByCurrentProcess(lock, sessionId)) {
+  try {
+    if (lockOwnedByCurrentProcess(lock, sessionId)) {
+      rmSync(path, { force: true });
+    }
+  } catch (error: unknown) {
+    console.warn(`agent-telegram: failed to remove lock metadata: ${sanitizedError(error)}`);
+  } finally {
+    ownershipLeases.delete(path);
     try {
-      rmSync(lockPath(config), { force: true });
+      releaseOwnershipLock(lease.token);
     } catch (error: unknown) {
-      console.warn(`agent-telegram: failed to remove lock: ${sanitizedError(error)}`);
+      console.warn(`agent-telegram: failed to release ownership lock: ${sanitizedError(error)}`);
     }
   }
-}
-
-export function isLockStale(config: Config, lock: LockData | null): boolean {
-  if (!lock) return true;
-  const updatedAt = parseTimeMs(lock.updatedAt || lock.connectedAt);
-  if (!Number.isFinite(updatedAt)) return true;
-  const heartbeatExpired = Date.now() - (updatedAt as number) > config.LOCK_STALE_AFTER_MS;
-
-  if (lock.hostname && lock.hostname !== hostname()) return heartbeatExpired;
-
-  try {
-    process.kill(lock.pid, 0);
-  } catch {
-    return true;
-  }
-  if (lock && lock.processStartToken) {
-    const current = getProcessStartToken(lock.pid);
-    if (current && current !== lock.processStartToken) return true;
-  }
-  return false;
 }
 
 // --- Health ---
@@ -379,7 +480,7 @@ export interface QueuedPromptState {
   messageId: number;
   text: string;
   replyContext: string | null;
-  /** In-memory descriptor identity captured after download. */
+  /** In-memory admitted attachment leases. */
   inboxFiles: InboxFile[];
   enqueuedAt: string;
 }
@@ -599,6 +700,14 @@ export function resetSessionUiState(): void {
 
 /** Test helper to reset module-level runtime state. */
 export function resetRuntimeStateForTests(): void {
+  for (const [path, lease] of ownershipLeases) {
+    try {
+      releaseOwnershipLock(lease.token);
+    } catch {
+      // Tests may deliberately compromise or remove a lock.
+    }
+    ownershipLeases.delete(path);
+  }
   activePrompt = null;
   pendingPermission = null;
   typingStartedAt = null;

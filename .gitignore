@@ -3,6 +3,7 @@ node_modules/
 
 # Build
 dist/
+native/build/
 *.tsbuildinfo
 
 # Environment and secrets

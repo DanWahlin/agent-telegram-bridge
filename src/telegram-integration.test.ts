@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { platform, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   createTelegramBot,
@@ -162,10 +162,17 @@ describe("Telegram authorization and prompt dispatch", () => {
       const payload = deps.onPrompt.mock.calls[0]?.[1];
       expect(payload?.text).toBe("What is in this photo?");
       expect(payload?.inboxFiles).toHaveLength(1);
-      const filePath = payload?.inboxFiles[0]?.path;
-      expect(filePath && existsSync(filePath)).toBe(true);
-      expect(filePath ? statSync(filePath).mode & 0o777 : 0).toBe(0o600);
-      if (filePath) rmSync(filePath, { force: true });
+      const admitted = payload?.inboxFiles[0];
+      if (platform() === "darwin") {
+        expect(admitted?.transport).toBe("darwin-inline");
+        expect(admitted?.path).toBe("");
+        expect(admitted?.inlineData?.length).toBe(4);
+      } else {
+        const filePath = admitted?.path;
+        expect(filePath && existsSync(filePath)).toBe(true);
+        expect(filePath ? statSync(filePath).mode & 0o777 : 0).toBe(0o600);
+        if (filePath) rmSync(filePath, { force: true });
+      }
     } finally {
       resetTelegramRuntimeForTests();
       resetRuntimeStateForTests();

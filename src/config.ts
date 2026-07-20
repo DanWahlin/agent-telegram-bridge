@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { resolve } from "node:path";
 import { existsSync, lstatSync, realpathSync, statSync } from "node:fs";
+import { platform } from "node:os";
 import dotenv from "dotenv";
 import { parseCwdAllowlist, parseMimeAllowlist } from "./media.js";
 import {
@@ -32,7 +33,6 @@ const EnvSchema = z.object({
   PAIRING_EXPIRY_MS: z.coerce.number().int().positive().default(5 * 60 * 1000),
   PAIRING_PENDING_MAX: z.coerce.number().int().positive().max(1000).default(100),
   PERMISSION_TIMEOUT_MS: z.coerce.number().int().positive().default(5 * 60 * 1000),
-  LOCK_STALE_AFTER_MS: z.coerce.number().int().positive().default((30 + 60 + 45) * 1000),
   PROMPT_STALE_AFTER_MS: z.coerce.number().int().positive().default(15 * 60 * 1000),
   MAX_TYPING_SESSION_MS: z.coerce.number().int().positive().default(30 * 60 * 1000),
   STREAM_EDIT_INTERVAL_MS: z.coerce.number().int().positive().default(1500),
@@ -115,10 +115,11 @@ export function resolveAgentBinary(
   configured: string,
   home: string | undefined,
   fileExists: (path: string) => boolean = existsSync,
+  hostPlatform: NodeJS.Platform = platform(),
 ): string {
   const trimmed = configured.trim();
   if (provider === "copilot") {
-    return trimmed || DEFAULT_AGENT_BINS.copilot;
+    return trimmed || (hostPlatform === "darwin" ? "copilot" : DEFAULT_AGENT_BINS.copilot);
   }
   if (trimmed && trimmed !== "grok") return trimmed;
   const candidates = [home ? `${home}/.grok/bin/grok` : null, "grok"]

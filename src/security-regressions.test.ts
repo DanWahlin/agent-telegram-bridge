@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   chmodSync,
   existsSync,
+  linkSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -13,14 +14,20 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import { Worker } from "node:worker_threads";
 import {
   acquireLock,
   buildHealthSnapshot,
   completePairing,
   ensureStateDir,
+  getAuthorizedNotificationChatId,
+  lifecycleNotificationDue,
+  markLifecycleNotification,
   readLock,
   reloadAccess,
+  rememberAuthorizedPrivateChat,
   removeLock,
+  saveAccess,
   saveJsonAtomic,
   startPairing,
   type AccessState,
@@ -43,9 +50,10 @@ import {
   cleanupInboxFiles,
   writeInboxFile,
 } from "./media.js";
+import { initializePlatformSecurity } from "./platform-security.js";
 
 function configFor(dir: string) {
-  return createTestConfig(dir, { LOCK_STALE_AFTER_MS: 1_000 });
+  return createTestConfig(dir);
 }
 
 describe("Telegram outbound queue", () => {
@@ -95,15 +103,54 @@ describe("pairing and state hardening", () => {
     const access: AccessState = { allowedUsers: [], pending: {} };
     const code = startPairing(config, access, 42);
 
-    expect(completePairing(config, access, 42, 99, "WRONG1")).toBe(false);
+    expect(completePairing(config, access, 42, 42, "WRONG1")).toBe(false);
     expect(access.pending["42"]?.code).toBe(code);
     expect(access.pending["42"]?.attempts).toBe(1);
-    expect(completePairing(config, access, 42, 99, code)).toBe(true);
-    expect(access.allowedUsers).toEqual(["99"]);
+    expect(completePairing(config, access, 42, 42, code)).toBe(true);
+    expect(access.allowedUsers).toEqual(["42"]);
+    expect(access.notificationTarget).toEqual({ chatId: "42", userId: "42" });
+    expect(getAuthorizedNotificationChatId(config)).toBe(42);
+  });
+
+  it("records lifecycle notification targets only for authorized private chats", () => {
+    const config = configFor(dir);
+    ensureStateDir(config);
+    const access: AccessState = { allowedUsers: ["42"], pending: {} };
+
+    expect(rememberAuthorizedPrivateChat(config, access, 42, 100)).toBe(false);
+    expect(access.notificationTarget).toBeUndefined();
+    expect(rememberAuthorizedPrivateChat(config, access, -42, 42)).toBe(false);
+    expect(rememberAuthorizedPrivateChat(config, access, 99, 42)).toBe(false);
+    expect(rememberAuthorizedPrivateChat(config, access, 42, 42)).toBe(true);
+    expect(getAuthorizedNotificationChatId(config)).toBe(42);
+  });
+
+  it("rejects malformed or mismatched persisted lifecycle destinations", () => {
+    const config = configFor(dir);
+    ensureStateDir(config);
+    for (const notificationTarget of [
+      { chatId: "-42", userId: "42" },
+      { chatId: "99", userId: "42" },
+      { chatId: "not-a-chat", userId: "42" },
+    ]) {
+      saveAccess(config, { allowedUsers: ["42"], pending: {}, notificationTarget });
+      expect(getAuthorizedNotificationChatId(config)).toBeNull();
+    }
+  });
+
+  it("rate limits repeated lifecycle notifications by kind", () => {
+    const config = configFor(dir);
+    ensureStateDir(config);
+
+    expect(lifecycleNotificationDue(config, "ready", 100_000)).toBe(true);
+    markLifecycleNotification(config, "ready", 100_000);
+    expect(lifecycleNotificationDue(config, "ready", 159_999)).toBe(false);
+    expect(lifecycleNotificationDue(config, "ready", 160_000)).toBe(true);
+    expect(lifecycleNotificationDue(config, "disconnected", 100_001)).toBe(true);
   });
 
   it("caps simultaneous pending pairing challenges", () => {
-    const config = createTestConfig(dir, { LOCK_STALE_AFTER_MS: 1_000, PAIRING_PENDING_MAX: 2 });
+    const config = createTestConfig(dir, { PAIRING_PENDING_MAX: 2 });
     ensureStateDir(config);
     const access: AccessState = { allowedUsers: [], pending: {} };
     startPairing(config, access, 1);
@@ -133,7 +180,90 @@ describe("pairing and state hardening", () => {
     acquireLock(config, "first");
     expect(readLock(config)?.sessionId).toBe("first");
     expect(() => acquireLock(config, "second")).toThrow(/already locked/);
+    removeLock(config, "wrong-session");
+    expect(() => acquireLock(config, "second")).toThrow(/already locked/);
     removeLock(config, "first");
+    acquireLock(config, "second");
+    removeLock(config, "second");
+  });
+
+  it("reports an unsafe ownership inode as a lock security failure", () => {
+    const config = configFor(dir);
+    ensureStateDir(config);
+    acquireLock(config, "owner");
+    removeLock(config, "owner");
+    linkSync(join(dir, "lock.json.ownership"), join(dir, "ownership-alias"));
+
+    expect(() => acquireLock(config, "replacement"))
+      .toThrow(/Could not acquire bot ownership lock.*singly linked/);
+  });
+
+  it("rejects loading the lock addon in a second Node environment", async () => {
+    initializePlatformSecurity();
+    const addonPath = join(process.cwd(), "dist/native/platform_security.node");
+    const worker = new Worker(`
+      const { parentPort, workerData } = require('node:worker_threads');
+      try {
+        require(workerData);
+        parentPort.postMessage('unexpectedly-loaded');
+      } catch (error) {
+        parentPort.postMessage(String(error && error.message));
+      }
+    `, { eval: true, workerData: addonPath });
+    const messagePromise = once(worker, "message") as Promise<[string]>;
+    const exitPromise = once(worker, "exit");
+    const [message] = await messagePromise;
+    await exitPromise;
+    expect(message).toMatch(/primary Node environment/);
+  });
+
+  it("recovers after owner crash without replacing the lock inode", async () => {
+    const stateDir = join(dir, "contended");
+    mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+    const ownershipDir = join(stateDir, "lock.json.ownership");
+
+    const code = `
+      import { acquireLock, ensureStateDir, removeLock } from './src/state.ts';
+      import { createTestConfig } from './src/test-support.ts';
+      const id = process.env.TEST_LOCK_ID;
+      const config = createTestConfig(process.env.TEST_LOCK_DIR);
+      ensureStateDir(config);
+      try {
+        acquireLock(config, id);
+        process.stdout.write('ACQUIRED:' + id + '\\n');
+        if (process.env.TEST_LOCK_MODE === 'crash') process.exit(0);
+        setTimeout(() => { removeLock(config, id); process.exit(0); }, 300);
+      } catch {
+        process.stdout.write('REJECTED:' + id + '\\n');
+        process.exit(0);
+      }
+    `;
+    const contend = (id: string, mode = "hold") => new Promise<string>((resolve, reject) => {
+      const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", code], {
+        cwd: process.cwd(),
+        env: { ...process.env, TEST_LOCK_DIR: stateDir, TEST_LOCK_ID: id, TEST_LOCK_MODE: mode },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let output = "";
+      let errorOutput = "";
+      child.stdout?.on("data", (chunk: Buffer) => { output += chunk.toString(); });
+      child.stderr?.on("data", (chunk: Buffer) => { errorOutput += chunk.toString(); });
+      child.on("error", reject);
+      child.on("close", (code, signal) => {
+        if (code !== 0) {
+          reject(new Error(errorOutput || `Lock contender exited with code ${code} signal ${signal}`));
+        } else {
+          resolve(output);
+        }
+      });
+    });
+
+    expect(await contend("crashed", "crash")).toContain("ACQUIRED:crashed");
+    const inode = statSync(ownershipDir).ino;
+    const outcomes = await Promise.all([contend("one"), contend("two")]);
+    expect(outcomes.filter((outcome) => outcome.includes("ACQUIRED:"))).toHaveLength(1);
+    expect(outcomes.filter((outcome) => outcome.includes("REJECTED:"))).toHaveLength(1);
+    expect(statSync(ownershipDir).ino).toBe(inode);
   });
 
   it("falls back safely when state JSON has the wrong shape", () => {
@@ -333,7 +463,7 @@ describe("ACP process ownership", () => {
   });
 
   it("proves the spawned process is running in the authorized directory identity", async () => {
-    if (process.platform !== "linux") return;
+    if (process.platform !== "linux" && process.platform !== "darwin") return;
     const parent = mkdtempSync(join(tmpdir(), "grok-tg-process-cwd-"));
     const allowed = join(parent, "allowed");
     const other = join(parent, "other");

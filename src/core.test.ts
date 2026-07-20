@@ -252,7 +252,7 @@ describe("media and prompt blocks", () => {
     }
   });
 
-  it("refuses a symlinked inbox control file", () => {
+  it.runIf(process.platform === "linux")("refuses a symlinked inbox control file", () => {
     const parent = mkdtempSync(join(tmpdir(), "grok-tg-inbox-control-"));
     try {
       const root = captureRootIdentity(parent);
@@ -269,7 +269,7 @@ describe("media and prompt blocks", () => {
     }
   });
 
-  it("refuses a hard-linked inbox control file before truncation", () => {
+  it.runIf(process.platform === "linux")("refuses a hard-linked inbox control file before truncation", () => {
     const parent = mkdtempSync(join(tmpdir(), "grok-tg-inbox-hardlink-"));
     try {
       const root = captureRootIdentity(parent);
@@ -286,7 +286,7 @@ describe("media and prompt blocks", () => {
     }
   });
 
-  it("repairs permissive inbox directory permissions", () => {
+  it.runIf(process.platform === "linux")("repairs permissive inbox directory permissions", () => {
     const parent = mkdtempSync(join(tmpdir(), "grok-tg-inbox-mode-"));
     try {
       const root = captureRootIdentity(parent);
@@ -301,7 +301,7 @@ describe("media and prompt blocks", () => {
     }
   });
 
-  it("rejects reads and cleanup after the inbox directory is swapped", () => {
+  it.runIf(process.platform === "linux")("rejects reads and cleanup after the inbox directory is swapped", () => {
     const parent = mkdtempSync(join(tmpdir(), "grok-tg-inbox-swap-"));
     const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     try {
@@ -327,7 +327,7 @@ describe("media and prompt blocks", () => {
     }
   });
 
-  it("rejects same-inode attachment tampering after admission", () => {
+  it.runIf(process.platform === "linux")("rejects same-inode attachment tampering after admission", () => {
     const parent = mkdtempSync(join(tmpdir(), "grok-tg-inbox-content-"));
     try {
       const file = writeInboxFile(captureRootIdentity(parent), "note.txt", Buffer.from("trusted"));
@@ -358,7 +358,7 @@ describe("media and prompt blocks", () => {
     }
   });
 
-  it("builds image content blocks when the agent advertises image prompts", () => {
+  it.runIf(process.platform === "linux")("builds image content blocks when the agent advertises image prompts", () => {
     const dir = mkdtempSync(join(tmpdir(), "grok-tg-blocks-"));
     try {
       const file = writeInboxFile(captureRootIdentity(dir), "shot.png", Buffer.from("fake-png"));
@@ -376,7 +376,7 @@ describe("media and prompt blocks", () => {
     }
   });
 
-  it("retires the admitted opened file without touching a swapped pathname", () => {
+  it.runIf(process.platform === "linux")("retires the admitted opened file without touching a swapped pathname", () => {
     const parent = mkdtempSync(join(tmpdir(), "grok-tg-cleanup-swap-"));
     try {
       const root = captureRootIdentity(parent);
@@ -396,7 +396,7 @@ describe("media and prompt blocks", () => {
     }
   });
 
-  it("keeps fallback resource links bound to the admitted file descriptor", () => {
+  it.runIf(process.platform === "linux")("keeps fallback resource links bound to the admitted file descriptor", () => {
     const dir = mkdtempSync(join(tmpdir(), "grok-tg-descriptor-link-"));
     const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     try {
@@ -418,7 +418,87 @@ describe("media and prompt blocks", () => {
     }
   });
 
-  it("falls back to resource_link when image capability is absent", () => {
+  it("keeps macOS attachments inline without creating or exposing a path", () => {
+    const dir = mkdtempSync(join(tmpdir(), "agent-tg-darwin-inline-"));
+    try {
+      const file = writeInboxFile(
+        captureRootIdentity(dir),
+        "shot.png",
+        Buffer.from("fake-png"),
+        "darwin",
+      );
+      file.mime = "image/png";
+      expect(file.transport).toBe("darwin-inline");
+      expect(file.path).toBe("");
+      expect(existsSync(join(dir, ".tg-inbox"))).toBe(false);
+
+      const { blocks, notes } = buildPromptBlocks({
+        text: "inspect",
+        files: [file],
+        capabilities: { image: true },
+      });
+      const image = blocks.find((block) => block.type === "image");
+      expect(image?.type).toBe("image");
+      if (!image || image.type !== "image") throw new Error("image missing");
+      expect(image.uri).toMatch(/^urn:agent-telegram:sha256:/);
+      expect(JSON.stringify(blocks)).not.toContain("file://");
+      expect(JSON.stringify(blocks)).not.toContain(dir);
+      expect(notes.join("\n")).not.toContain(dir);
+
+      const retained = file.inlineData;
+      expect(retained).not.toBeNull();
+      cleanupInboxFiles([file]);
+      expect(file.inlineData).toBeNull();
+      expect(retained?.every((byte) => byte === 0)).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("embeds macOS text resources with opaque URNs", () => {
+    const dir = mkdtempSync(join(tmpdir(), "agent-tg-darwin-text-"));
+    try {
+      const file = writeInboxFile(
+        captureRootIdentity(dir),
+        "note.txt",
+        Buffer.from("trusted"),
+        "darwin",
+      );
+      const { blocks } = buildPromptBlocks({
+        text: "inspect",
+        files: [file],
+        capabilities: { embeddedContext: true },
+      });
+      const resource = blocks.find((block) => block.type === "resource");
+      expect(resource?.type).toBe("resource");
+      if (!resource || resource.type !== "resource") throw new Error("resource missing");
+      expect(resource.resource.uri).toMatch(/^urn:agent-telegram:sha256:/);
+      expect("text" in resource.resource ? resource.resource.text : null).toBe("trusted");
+      cleanupInboxFiles([file]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects macOS attachments when the agent lacks an inline capability", () => {
+    const dir = mkdtempSync(join(tmpdir(), "agent-tg-darwin-capability-"));
+    try {
+      const file = writeInboxFile(
+        captureRootIdentity(dir),
+        "archive.zip",
+        Buffer.from("binary"),
+        "darwin",
+      );
+      expect(() => buildPromptBlocks({ text: "inspect", files: [file], capabilities: {} }))
+        .toThrow(/does not support secure inline/);
+      expect(file.path).toBe("");
+      cleanupInboxFiles([file]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.runIf(process.platform === "linux")("falls back to resource_link when image capability is absent", () => {
     const dir = mkdtempSync(join(tmpdir(), "grok-tg-link-"));
     try {
       const file = writeInboxFile(captureRootIdentity(dir), "shot.png", Buffer.from("fake-png"));
@@ -514,6 +594,11 @@ describe("public repository safety defaults", () => {
     });
     expect(resolved).toBe("/home/example/.grok/bin/grok");
     expect(checked).not.toContain("/root/.grok/bin/grok");
+  });
+
+  it("uses PATH to resolve Copilot on macOS", () => {
+    expect(resolveAgentBinary("copilot", "", "/Users/example", () => false, "darwin"))
+      .toBe("copilot");
   });
 
   it("rejects runtime state or agent workspaces inside build output", () => {
