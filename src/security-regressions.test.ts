@@ -20,9 +20,14 @@ import {
   buildHealthSnapshot,
   completePairing,
   ensureStateDir,
+  getAuthorizedNotificationChatId,
+  lifecycleNotificationDue,
+  markLifecycleNotification,
   readLock,
   reloadAccess,
+  rememberAuthorizedPrivateChat,
   removeLock,
+  saveAccess,
   saveJsonAtomic,
   startPairing,
   type AccessState,
@@ -98,11 +103,50 @@ describe("pairing and state hardening", () => {
     const access: AccessState = { allowedUsers: [], pending: {} };
     const code = startPairing(config, access, 42);
 
-    expect(completePairing(config, access, 42, 99, "WRONG1")).toBe(false);
+    expect(completePairing(config, access, 42, 42, "WRONG1")).toBe(false);
     expect(access.pending["42"]?.code).toBe(code);
     expect(access.pending["42"]?.attempts).toBe(1);
-    expect(completePairing(config, access, 42, 99, code)).toBe(true);
-    expect(access.allowedUsers).toEqual(["99"]);
+    expect(completePairing(config, access, 42, 42, code)).toBe(true);
+    expect(access.allowedUsers).toEqual(["42"]);
+    expect(access.notificationTarget).toEqual({ chatId: "42", userId: "42" });
+    expect(getAuthorizedNotificationChatId(config)).toBe(42);
+  });
+
+  it("records lifecycle notification targets only for authorized private chats", () => {
+    const config = configFor(dir);
+    ensureStateDir(config);
+    const access: AccessState = { allowedUsers: ["42"], pending: {} };
+
+    expect(rememberAuthorizedPrivateChat(config, access, 42, 100)).toBe(false);
+    expect(access.notificationTarget).toBeUndefined();
+    expect(rememberAuthorizedPrivateChat(config, access, -42, 42)).toBe(false);
+    expect(rememberAuthorizedPrivateChat(config, access, 99, 42)).toBe(false);
+    expect(rememberAuthorizedPrivateChat(config, access, 42, 42)).toBe(true);
+    expect(getAuthorizedNotificationChatId(config)).toBe(42);
+  });
+
+  it("rejects malformed or mismatched persisted lifecycle destinations", () => {
+    const config = configFor(dir);
+    ensureStateDir(config);
+    for (const notificationTarget of [
+      { chatId: "-42", userId: "42" },
+      { chatId: "99", userId: "42" },
+      { chatId: "not-a-chat", userId: "42" },
+    ]) {
+      saveAccess(config, { allowedUsers: ["42"], pending: {}, notificationTarget });
+      expect(getAuthorizedNotificationChatId(config)).toBeNull();
+    }
+  });
+
+  it("rate limits repeated lifecycle notifications by kind", () => {
+    const config = configFor(dir);
+    ensureStateDir(config);
+
+    expect(lifecycleNotificationDue(config, "ready", 100_000)).toBe(true);
+    markLifecycleNotification(config, "ready", 100_000);
+    expect(lifecycleNotificationDue(config, "ready", 159_999)).toBe(false);
+    expect(lifecycleNotificationDue(config, "ready", 160_000)).toBe(true);
+    expect(lifecycleNotificationDue(config, "disconnected", 100_001)).toBe(true);
   });
 
   it("caps simultaneous pending pairing challenges", () => {

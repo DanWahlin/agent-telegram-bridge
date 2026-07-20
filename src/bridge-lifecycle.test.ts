@@ -24,6 +24,7 @@ import {
   clearActivePrompt,
   getActivePrompt,
   readLock,
+  saveAccess,
   setPendingPermission,
   startActivePrompt,
 } from "./state.js";
@@ -35,9 +36,46 @@ function fakeBot(): Bot {
   } as unknown as Bot;
 }
 
+function startedBot(onStartCalls = 1): Bot {
+  let releasePolling!: () => void;
+  const pollingStopped = new Promise<void>((resolve) => {
+    releasePolling = resolve;
+  });
+  return {
+    start: vi.fn(async (options?: {
+      onStart?: (me: { first_name: string; username?: string }) => void | Promise<void>;
+    }) => {
+      for (let i = 0; i < onStartCalls; i += 1) {
+        await options?.onStart?.({ first_name: "Test Agent", username: "test_agent_bot" });
+      }
+      await pollingStopped;
+    }),
+    stop: vi.fn(async () => { releasePolling(); }),
+  } as unknown as Bot;
+}
+
+function failingStartedBot(): Bot {
+  return {
+    start: vi.fn(async (options?: {
+      onStart?: (me: { first_name: string; username?: string }) => void | Promise<void>;
+    }) => {
+      await options?.onStart?.({ first_name: "Test Agent", username: "test_agent_bot" });
+      throw new Error("409 Conflict: terminated by other getUpdates request");
+    }),
+    stop: vi.fn(async () => undefined),
+  } as unknown as Bot;
+}
+
 function requireTelegramDeps(value: TelegramDeps | null): TelegramDeps {
   if (!value) throw new Error("Telegram dependencies were not captured");
   return value;
+}
+
+async function waitUntil(predicate: () => boolean): Promise<void> {
+  for (let i = 0; i < 50 && !predicate(); i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+  expect(predicate()).toBe(true);
 }
 
 function idleAcp(config: ReturnType<typeof createTestConfig>): AcpClientHandle {
@@ -65,6 +103,217 @@ describe("bridge lifecycle transitions", () => {
     resetTelegramRuntimeForTests();
     vi.restoreAllMocks();
     if (stateDir) rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  it("notifies the persisted authorized chat when the bridge connects and disconnects", async () => {
+    stateDir = mkdtempSync(join(tmpdir(), "agent-tg-lifecycle-notify-"));
+    const config = createTestConfig(stateDir);
+    setTelegramRuntimeForTests("test-token", config);
+    saveAccess(config, {
+      allowedUsers: ["42"],
+      pending: {},
+      notificationTarget: { chatId: "42", userId: "42" },
+    });
+    const messages: Array<{ chatId: number; text: string }> = [];
+    const events: string[] = [];
+    const handle = idleAcp(config);
+    handle.shutdown = vi.fn(async () => { events.push("acp-shutdown"); });
+    const bot = startedBot();
+    const bridge = createBridge(config, {
+      createAcpClient: () => handle,
+      createTelegramBot: () => bot,
+      stopPolling: vi.fn(async (instance) => {
+        events.push("polling-stopped");
+        await instance.stop();
+      }),
+      sendLifecycleMessage: vi.fn(async (chatId, text) => {
+        messages.push({ chatId, text });
+        if (text.includes("disconnected")) events.push("disconnect-notified");
+        return { message_id: messages.length };
+      }),
+      pollingReadyDelayMs: 0,
+    });
+
+    const running = bridge.start();
+    await waitUntil(() => messages.length === 1);
+    await bridge.shutdown();
+    await running;
+
+    expect(messages).toEqual([
+      { chatId: 42, text: "🟢 Grok Build bridge connected and ready." },
+      { chatId: 42, text: "🔴 Grok Build bridge disconnected." },
+    ]);
+    expect(events.indexOf("disconnect-notified")).toBeGreaterThan(events.indexOf("polling-stopped"));
+    expect(events.indexOf("disconnect-notified")).toBeGreaterThan(events.lastIndexOf("acp-shutdown"));
+  });
+
+  it("does not send lifecycle messages without a persisted authorized chat", async () => {
+    stateDir = mkdtempSync(join(tmpdir(), "agent-tg-lifecycle-no-target-"));
+    const config = createTestConfig(stateDir);
+    setTelegramRuntimeForTests("test-token", config);
+    saveAccess(config, { allowedUsers: ["7"], pending: {} });
+    const sendLifecycleMessage = vi.fn(async () => ({ message_id: 1 }));
+    const bridge = createBridge(config, {
+      createAcpClient: () => idleAcp(config),
+      createTelegramBot: () => startedBot(),
+      sendLifecycleMessage,
+      pollingReadyDelayMs: 0,
+    });
+
+    const running = bridge.start();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(readLock(config)).not.toBeNull();
+    await bridge.shutdown();
+    await running;
+
+    expect(sendLifecycleMessage).not.toHaveBeenCalled();
+  });
+
+  it("does not duplicate a ready message when startup readiness fires twice", async () => {
+    stateDir = mkdtempSync(join(tmpdir(), "agent-tg-lifecycle-duplicate-"));
+    const config = createTestConfig(stateDir);
+    setTelegramRuntimeForTests("test-token", config);
+    saveAccess(config, {
+      allowedUsers: ["42"],
+      pending: {},
+      notificationTarget: { chatId: "42", userId: "42" },
+    });
+    const messages: string[] = [];
+    const bridge = createBridge(config, {
+      createAcpClient: () => idleAcp(config),
+      createTelegramBot: () => startedBot(2),
+      sendLifecycleMessage: vi.fn(async (_chatId, text) => {
+        messages.push(text);
+        return { message_id: messages.length };
+      }),
+      pollingReadyDelayMs: 0,
+    });
+
+    const running = bridge.start();
+    await waitUntil(() => messages.length === 1);
+    expect(messages).toEqual(["🟢 Grok Build bridge connected and ready."]);
+    await bridge.shutdown();
+    await running;
+  });
+
+  it("keeps ownership healthy when a lifecycle message fails", async () => {
+    stateDir = mkdtempSync(join(tmpdir(), "agent-tg-lifecycle-failure-"));
+    const config = createTestConfig(stateDir);
+    setTelegramRuntimeForTests("test-token", config);
+    saveAccess(config, {
+      allowedUsers: ["42"],
+      pending: {},
+      notificationTarget: { chatId: "42", userId: "42" },
+    });
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const bridge = createBridge(config, {
+      createAcpClient: () => idleAcp(config),
+      createTelegramBot: () => startedBot(),
+      sendLifecycleMessage: vi.fn(async () => { throw new Error("Telegram unavailable"); }),
+      pollingReadyDelayMs: 0,
+    });
+
+    const running = bridge.start();
+    await waitUntil(() => warning.mock.calls.some(([message]) => String(message).includes("Lifecycle ready")));
+    expect(readLock(config)).not.toBeNull();
+    await bridge.shutdown();
+    await running;
+    expect(readLock(config)).toBeNull();
+    expect(warning).toHaveBeenCalledWith(expect.stringContaining("Lifecycle ready notification failed"));
+  });
+
+  it("does not claim readiness when polling fails immediately after initialization", async () => {
+    stateDir = mkdtempSync(join(tmpdir(), "agent-tg-lifecycle-poll-failure-"));
+    const config = createTestConfig(stateDir);
+    setTelegramRuntimeForTests("test-token", config);
+    saveAccess(config, {
+      allowedUsers: ["42"],
+      pending: {},
+      notificationTarget: { chatId: "42", userId: "42" },
+    });
+    const messages: string[] = [];
+    const bridge = createBridge(config, {
+      createAcpClient: () => idleAcp(config),
+      createTelegramBot: () => failingStartedBot(),
+      sendLifecycleMessage: vi.fn(async (_chatId, text) => {
+        messages.push(text);
+        return { message_id: messages.length };
+      }),
+      pollingReadyDelayMs: 10,
+    });
+
+    await expect(bridge.start()).rejects.toThrow(/409 Conflict/);
+    expect(messages).not.toContain("🟢 Grok Build bridge connected and ready.");
+  });
+
+  it("bounds a stalled disconnect notification before continuing teardown", async () => {
+    stateDir = mkdtempSync(join(tmpdir(), "agent-tg-lifecycle-disconnect-budget-"));
+    const config = createTestConfig(stateDir);
+    setTelegramRuntimeForTests("test-token", config);
+    saveAccess(config, {
+      allowedUsers: ["42"],
+      pending: {},
+      notificationTarget: { chatId: "42", userId: "42" },
+    });
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const messages: string[] = [];
+    const bridge = createBridge(config, {
+      createAcpClient: () => idleAcp(config),
+      createTelegramBot: () => startedBot(),
+      sendLifecycleMessage: vi.fn((_chatId, text) => {
+        messages.push(text);
+        return text.includes("disconnected")
+          ? new Promise<never>(() => undefined)
+          : Promise.resolve({ message_id: messages.length });
+      }),
+      pollingReadyDelayMs: 0,
+      disconnectNotificationWaitMs: 5,
+    });
+
+    const running = bridge.start();
+    await waitUntil(() => messages.length === 1);
+    const shutdownCompleted = await Promise.race([
+      bridge.shutdown().then(() => true),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 100)),
+    ]);
+    await running;
+
+    expect(shutdownCompleted).toBe(true);
+    expect(warning).toHaveBeenCalledWith(expect.stringContaining("exceeded its shutdown budget"));
+  });
+
+  it("continues teardown when lifecycle state cannot be read", async () => {
+    stateDir = mkdtempSync(join(tmpdir(), "agent-tg-lifecycle-state-failure-"));
+    const config = createTestConfig(stateDir);
+    setTelegramRuntimeForTests("test-token", config);
+    saveAccess(config, {
+      allowedUsers: ["42"],
+      pending: {},
+      notificationTarget: { chatId: "42", userId: "42" },
+    });
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const messages: string[] = [];
+    const bridge = createBridge(config, {
+      createAcpClient: () => idleAcp(config),
+      createTelegramBot: () => startedBot(),
+      sendLifecycleMessage: vi.fn(async (_chatId, text) => {
+        messages.push(text);
+        return { message_id: messages.length };
+      }),
+      pollingReadyDelayMs: 0,
+      disconnectNotificationWaitMs: 5,
+    });
+
+    const running = bridge.start();
+    await waitUntil(() => messages.length === 1);
+    rmSync(join(stateDir, "access.json"));
+    mkdirSync(join(stateDir, "access.json"));
+
+    await expect(bridge.shutdown()).resolves.toBeUndefined();
+    await running;
+
+    expect(readLock(config)).toBeNull();
+    expect(warning).toHaveBeenCalledWith(expect.stringContaining("Lifecycle disconnected notification failed"));
   });
 
   it("terminates and awaits the exact old prompt before creating a new ACP session", async () => {

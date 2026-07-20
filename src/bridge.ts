@@ -30,6 +30,10 @@ import {
   clearPromptQueue,
   promptQueueLength,
   startActivePrompt,
+  getAuthorizedNotificationChatId,
+  lifecycleNotificationDue,
+  markLifecycleNotification,
+  type LifecycleNotificationKind,
   type HealthSnapshotInput,
 } from "./state.js";
 import {
@@ -93,6 +97,9 @@ export interface BridgeFactories {
   createAcpClient?: typeof createAcpClient;
   createTelegramBot?: (config: Config, deps: TelegramDeps) => Bot;
   stopPolling?: typeof stopPolling;
+  sendLifecycleMessage?: typeof sendMessage;
+  pollingReadyDelayMs?: number;
+  disconnectNotificationWaitMs?: number;
 }
 
 export function createBridge(config: Config, factories: BridgeFactories = {}): Bridge {
@@ -115,6 +122,8 @@ export function createBridge(config: Config, factories: BridgeFactories = {}): B
   let lifecycleCompromised = false;
   let shuttingDown = false;
   let promptTask: Promise<void> | null = null;
+  const lifecycleNotificationsInFlight = new Set<LifecycleNotificationKind>();
+  const lifecycleNotificationsSent = new Set<LifecycleNotificationKind>();
   const promptUiTasks = new Map<string, Set<Promise<void>>>();
   const closingPromptUiIds = new Set<string>();
   const allowedRootIdentities = new Map(
@@ -183,6 +192,43 @@ export function createBridge(config: Config, factories: BridgeFactories = {}): B
   } = createPermissionCards(config, reportHealth);
   const { clearStalePromptCard, upsertPlanMessage, updateThoughtStream } = createBridgeUi(config);
   const { runWatchdog } = createWatchdog(config, reportHealth);
+
+  async function notifyLifecycle(kind: LifecycleNotificationKind): Promise<void> {
+    if (lifecycleNotificationsInFlight.has(kind) || lifecycleNotificationsSent.has(kind)) return;
+    lifecycleNotificationsInFlight.add(kind);
+    try {
+      const chatId = getAuthorizedNotificationChatId(config);
+      if (chatId == null || !lifecycleNotificationDue(config, kind)) return;
+      if (kind === "ready"
+        && (!currentBotName || !acpClient.isConnected() || shuttingDown || lifecycleCompromised)) return;
+      if (kind === "disconnected" && !currentBotName) return;
+
+      const text = kind === "ready"
+        ? `🟢 ${config.agentDisplayName} bridge connected and ready.`
+        : `🔴 ${config.agentDisplayName} bridge disconnected.`;
+      await (factories.sendLifecycleMessage ?? sendMessage)(chatId, text);
+      lifecycleNotificationsSent.add(kind);
+      try {
+        markLifecycleNotification(config, kind);
+      } catch (error: unknown) {
+        console.warn(`[TG] Could not persist lifecycle ${kind} notification: ${sanitizedError(error)}`);
+      }
+    } catch (error: unknown) {
+      console.warn(`[TG] Lifecycle ${kind} notification failed: ${sanitizedError(error)}`);
+    } finally {
+      lifecycleNotificationsInFlight.delete(kind);
+    }
+  }
+
+  async function notifyDisconnectBestEffort(): Promise<void> {
+    const completed = await Promise.race([
+      notifyLifecycle("disconnected").then(() => true),
+      sleep(factories.disconnectNotificationWaitMs ?? 2_000).then(() => false),
+    ]);
+    if (!completed) {
+      console.warn("[TG] Disconnect notification exceeded its shutdown budget; continuing teardown.");
+    }
+  }
 
   function trackPromptUiTask(promptId: string, operation: Promise<void>): void {
     let tasks = promptUiTasks.get(promptId);
@@ -323,6 +369,7 @@ export function createBridge(config: Config, factories: BridgeFactories = {}): B
       await acpClient.connect();
       requireLifecycleOpen("ACP connect");
       validateRootIdentity(sessionRoot);
+      await notifyLifecycle("ready");
     } catch (error: unknown) {
       await shutdownAcpOwnership();
       throw error;
@@ -837,7 +884,11 @@ export function createBridge(config: Config, factories: BridgeFactories = {}): B
         console.log("[BRIDGE] No paired user. Send a private message to the bot to start pairing.");
       }
 
-      await bot.start({
+      let signalTelegramInitialized!: () => void;
+      const telegramInitialized = new Promise<void>((resolve) => {
+        signalTelegramInitialized = resolve;
+      });
+      const pollingTask = bot.start({
         allowed_updates: ["message", "callback_query"],
         onStart: (me) => {
           currentBotName = me.first_name;
@@ -846,8 +897,20 @@ export function createBridge(config: Config, factories: BridgeFactories = {}): B
             `[TG] ${currentBotUsername ? `@${currentBotUsername}` : currentBotName} ready.`,
           );
           writeHealthSnapshot(config, "tg-ready", buildExtra(), { force: true });
+          signalTelegramInitialized();
         },
       });
+      const pollingEndedBeforeReady = pollingTask.then(
+        () => { throw new Error("Telegram polling stopped before readiness was established"); },
+        (error: unknown) => { throw error; },
+      );
+      await Promise.race([telegramInitialized, pollingEndedBeforeReady]);
+      await Promise.race([
+        sleep(factories.pollingReadyDelayMs ?? 1_000),
+        pollingEndedBeforeReady,
+      ]);
+      await notifyLifecycle("ready");
+      await pollingTask;
     } catch (error: unknown) {
       await shutdown();
       throw error;
@@ -865,7 +928,6 @@ export function createBridge(config: Config, factories: BridgeFactories = {}): B
     shuttingDown = true;
     connected = false;
     queuePaused = true;
-    beginOutboundShutdown();
     const teardownErrors: unknown[] = [];
     const active = getActivePrompt();
     if (active) markActivePromptCancelling();
@@ -929,6 +991,8 @@ export function createBridge(config: Config, factories: BridgeFactories = {}): B
     await clearStalePromptCard(active);
     if (active) cleanupInboxFiles(active.inboxFiles);
     if (promptSettled) clearActivePrompt();
+    await notifyDisconnectBestEffort();
+    beginOutboundShutdown();
     try {
       await closeOutboundQueue();
     } catch (error: unknown) {

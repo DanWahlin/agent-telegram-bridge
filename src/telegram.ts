@@ -9,6 +9,7 @@ import {
   cleanExpiredPending,
   startPairing,
   completePairing,
+  rememberAuthorizedPrivateChat,
   startActivePrompt,
   clearActivePrompt,
   getActivePrompt,
@@ -134,6 +135,7 @@ function requireAuthorizedPrivate(
   if (userId == null) return null;
   const access = reloadAccess(config);
   if (!isAllowed(access, userId)) return null;
+  rememberAuthorizedPrivateChat(config, access, ctx.chat.id, userId);
   return { chatId: ctx.chat.id, userId };
 }
 
@@ -159,6 +161,10 @@ export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
     if (ctx.chat.type !== "private") {
       await sendMessage(ctx.chat.id, "This bridge only works in private chats.");
       return;
+    }
+    const access = reloadAccess(config);
+    if (ctx.from?.id != null && isAllowed(access, ctx.from.id)) {
+      rememberAuthorizedPrivateChat(config, access, ctx.chat.id, ctx.from.id);
     }
     const help = [
       `${config.agentDisplayName} Telegram Bridge`,
@@ -290,6 +296,7 @@ export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
       await answerCallbackQuery(ctx.callbackQuery.id, "Not authorized", true);
       return;
     }
+    rememberAuthorizedPrivateChat(config, access, ctx.chat.id, userIdStr);
     if (!mutationsAllowed()) {
       await answerCallbackQuery(ctx.callbackQuery.id, "Bridge temporarily unavailable", true);
       return;
@@ -438,6 +445,8 @@ export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
       console.log(`[PAIRING] User ${userId} chat ${chatId} code: ${code}`);
       return;
     }
+
+    rememberAuthorizedPrivateChat(config, access, chatId, userId);
 
     if (deps.canAcceptPrompts && !deps.canAcceptPrompts()) {
       await sendMessage(chatId, "Bridge is temporarily unavailable. Try again shortly.");

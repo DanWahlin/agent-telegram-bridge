@@ -24,6 +24,14 @@ import { sanitizedError, sanitizePermissionText } from "./redact.js";
 export interface AccessState {
   allowedUsers: string[];
   pending: Record<string, { code: string; timestamp: number; attempts?: number | undefined }>;
+  notificationTarget?: { chatId: string; userId: string } | undefined;
+}
+
+export type LifecycleNotificationKind = "ready" | "disconnected";
+
+interface LifecycleNotificationState {
+  readyAt: number | null;
+  disconnectedAt: number | null;
 }
 
 export interface LockData {
@@ -92,7 +100,20 @@ const PendingPairingSchema = z.object({
 const AccessStateSchema: ZodType<AccessState> = z.object({
   allowedUsers: z.array(z.string()),
   pending: z.record(z.string(), PendingPairingSchema),
+  notificationTarget: z.object({
+    chatId: z.string(),
+    userId: z.string(),
+  }).optional(),
 });
+const LifecycleNotificationStateSchema: ZodType<LifecycleNotificationState> = z.object({
+  readyAt: z.number().finite().nullable(),
+  disconnectedAt: z.number().finite().nullable(),
+});
+const DEFAULT_LIFECYCLE_NOTIFICATIONS: LifecycleNotificationState = {
+  readyAt: null,
+  disconnectedAt: null,
+};
+const LIFECYCLE_NOTIFICATION_MIN_INTERVAL_MS = 60_000;
 const LockDataSchema: ZodType<LockData> = z.object({
   pid: z.number().int().positive(),
   sessionId: z.string().min(1),
@@ -164,6 +185,9 @@ export function lockPath(config: Config): string {
 export function healthPath(config: Config): string {
   return join(config.stateDir, "health.json");
 }
+function lifecycleNotificationsPath(config: Config): string {
+  return join(config.stateDir, "lifecycle-notifications.json");
+}
 
 export function reloadAccess(config: Config): AccessState {
   return loadJsonOrDefault(accessPath(config), DEFAULT_ACCESS, AccessStateSchema);
@@ -175,6 +199,69 @@ export function saveAccess(config: Config, access: AccessState): void {
 
 export function isAllowed(access: AccessState, userId: number | string): boolean {
   return access.allowedUsers.includes(String(userId));
+}
+
+export function rememberAuthorizedPrivateChat(
+  config: Config,
+  access: AccessState,
+  chatId: number | string,
+  userId: number | string,
+): boolean {
+  const chatIdStr = String(chatId);
+  const userIdStr = String(userId);
+  if (!isAllowed(access, userIdStr)) return false;
+  const chatIdNumber = Number(chatIdStr);
+  const userIdNumber = Number(userIdStr);
+  if (!Number.isSafeInteger(chatIdNumber) || chatIdNumber <= 0
+    || !Number.isSafeInteger(userIdNumber) || userIdNumber <= 0
+    || chatIdNumber !== userIdNumber) return false;
+  if (access.notificationTarget?.chatId === chatIdStr
+    && access.notificationTarget.userId === userIdStr) return true;
+  access.notificationTarget = { chatId: chatIdStr, userId: userIdStr };
+  saveAccess(config, access);
+  return true;
+}
+
+export function getAuthorizedNotificationChatId(config: Config): number | null {
+  const access = reloadAccess(config);
+  const target = access.notificationTarget;
+  if (!target || !isAllowed(access, target.userId)) return null;
+  const chatId = Number(target.chatId);
+  const userId = Number(target.userId);
+  return Number.isSafeInteger(chatId) && chatId > 0
+    && Number.isSafeInteger(userId) && userId > 0
+    && chatId === userId
+    ? chatId
+    : null;
+}
+
+export function lifecycleNotificationDue(
+  config: Config,
+  kind: LifecycleNotificationKind,
+  now = Date.now(),
+): boolean {
+  const state = loadJsonOrDefault(
+    lifecycleNotificationsPath(config),
+    DEFAULT_LIFECYCLE_NOTIFICATIONS,
+    LifecycleNotificationStateSchema,
+  );
+  const last = kind === "ready" ? state.readyAt : state.disconnectedAt;
+  return last == null || now - last >= LIFECYCLE_NOTIFICATION_MIN_INTERVAL_MS;
+}
+
+export function markLifecycleNotification(
+  config: Config,
+  kind: LifecycleNotificationKind,
+  now = Date.now(),
+): void {
+  const state = loadJsonOrDefault(
+    lifecycleNotificationsPath(config),
+    DEFAULT_LIFECYCLE_NOTIFICATIONS,
+    LifecycleNotificationStateSchema,
+  );
+  if (kind === "ready") state.readyAt = now;
+  else state.disconnectedAt = now;
+  saveJsonAtomic(lifecycleNotificationsPath(config), state, 0o600);
 }
 
 export function cleanExpiredPending(config: Config, access: AccessState): boolean {
@@ -216,6 +303,7 @@ export function completePairing(
 ): boolean {
   const chatIdStr = String(chatId);
   const userIdStr = String(userId);
+  if (chatIdStr !== userIdStr) return false;
   const pending = access.pending?.[chatIdStr];
   if (!pending) return false;
   if (Date.now() - pending.timestamp > config.PAIRING_EXPIRY_MS) {
@@ -232,6 +320,7 @@ export function completePairing(
   if (!access.allowedUsers.includes(userIdStr)) {
     access.allowedUsers.push(userIdStr);
   }
+  access.notificationTarget = { chatId: chatIdStr, userId: userIdStr };
   delete access.pending[chatIdStr];
   saveAccess(config, access);
   return true;

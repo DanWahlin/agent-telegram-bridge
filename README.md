@@ -19,7 +19,7 @@ It does not expose an inbound HTTP server or Telegram webhook. Run one bridge in
 - **Interactive permissions**: choose **Allow once**, **Allow for session**, or the reject options offered by ACP. Resolved cards are replaced with their final status, and expired cards lose their buttons. Permissions are never approved automatically unless `AGENT_ALWAYS_APPROVE=true` (Grok prefers the session-scoped option; Copilot launches with `--allow-all`).
 - **Streaming responses**: throttled draft edits, ordered multi-message final responses, typing indicators, tool-progress bubbles, progress notices, plan cards, optional thought stream (`/verbose`), and stall recovery buttons.
 - **Single-poller protection**: a kernel-held ownership lock prevents competing bridge instances; PID, hostname, process-start token, and heartbeat metadata provide diagnostics.
-- **Operational visibility**: `/status` and `health.json` report session, prompt, permission, queue, cwd, usage, and tool activity.
+- **Operational visibility**: `/status` and `health.json` report session, prompt, permission, queue, cwd, usage, and tool activity. After pairing establishes a trusted private-chat destination, graceful shutdowns and fully ready restarts send rate-limited owner notifications. Abrupt process or host loss cannot be reported by the failed process itself.
 - **Child environment minimization**: the Telegram token is omitted from the agent subprocess environment, and sensitive values are redacted from permission summaries and logs. This is not an OS sandbox; see [Security model and limitations](#security-model-and-limitations).
 
 ## Requirements
