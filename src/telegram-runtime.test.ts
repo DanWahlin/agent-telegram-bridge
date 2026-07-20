@@ -20,7 +20,6 @@ import {
   startTyping,
   stopPolling,
   trackToolCall,
-  updateToolCall,
 } from "./telegram.js";
 import {
   clearActivePrompt,
@@ -241,7 +240,7 @@ describe("Telegram delivery runtime", () => {
 
     trackToolCall("tool-1", "Run command", { command: "npm test" });
     await vi.advanceTimersByTimeAsync(300);
-    updateToolCall("tool-1", "completed");
+    trackToolCall("tool-2", "Run command", { command: "npm run lint" });
     await vi.advanceTimersByTimeAsync(300);
     await dismissBubble();
 
@@ -252,6 +251,27 @@ describe("Telegram delivery runtime", () => {
     ]);
     expect(calls[0]?.payload.chat_id).toBe(42);
     expect(calls[0]?.payload.text).toContain("npm test");
+  });
+
+  it("does not edit a tool bubble when its rendered text is unchanged", async () => {
+    vi.useFakeTimers();
+    const calls: ApiCall[] = [];
+    const config = createTestConfig(stateDir, { SEND_PACE_MS: 0 });
+    setTelegramRuntimeForTests("test-token", config);
+    saveAccess(config, { allowedUsers: ["42"], pending: {} });
+    startActivePrompt(42, 1, 42);
+    stubTelegramApi(calls);
+
+    trackToolCall("tool-1", "Run command", { command: "npm test" });
+    await vi.advanceTimersByTimeAsync(300);
+    trackToolCall("tool-1", "Run command", { command: "npm test" });
+    await vi.advanceTimersByTimeAsync(300);
+    await dismissBubble();
+
+    expect(calls.map(({ method }) => method)).toEqual([
+      "sendMessage",
+      "deleteMessage",
+    ]);
   });
 
   it("replaces resolved permission cards and removes inline keyboards", async () => {

@@ -12,6 +12,7 @@ import {
 
 let bubbleActive = false;
 const bubbleMessageIds = new Map<number, number>();
+const bubbleMessageText = new Map<number, string>();
 const allBubbleIds = new Map<number, Set<number>>();
 let bubbleDebounceTimer: NodeJS.Timeout | null = null;
 let flushInProgress = false;
@@ -100,18 +101,22 @@ async function flushBubble(): Promise<void> {
 
     const currentMessageId = bubbleMessageIds.get(chatId);
     if (currentMessageId) {
+      if (bubbleMessageText.get(chatId) === text) return;
       try {
         await editFormattedMessage(chatId, currentMessageId, text);
+        bubbleMessageText.set(chatId, text);
         return;
       } catch (error: unknown) {
         if (!(error instanceof Error && /message to edit not found/i.test(error.message))) {
           throw error;
         }
         bubbleMessageIds.delete(chatId);
+        bubbleMessageText.delete(chatId);
       }
     }
     const sent = await sendFormattedMessage(chatId, text);
     rememberBubbleMessage(chatId, sent.message_id);
+    bubbleMessageText.set(chatId, text);
   } finally {
     flushInProgress = false;
     if (reflushNeeded) {
@@ -142,6 +147,7 @@ export async function dismissBubble(): Promise<void> {
   }
   allBubbleIds.clear();
   bubbleMessageIds.clear();
+  bubbleMessageText.clear();
 }
 
 export function trackToolCall(
@@ -184,6 +190,7 @@ export function resetBubblesForTests(): void {
   }
   bubbleMessageIds.clear();
   allBubbleIds.clear();
+  bubbleMessageText.clear();
   activeTools.clear();
   lastCompletedToolDesc = null;
   flushInProgress = false;
