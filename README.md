@@ -18,7 +18,7 @@ It does not expose an inbound HTTP server or Telegram webhook. Run one bridge in
 - **Prompt queue**: text follow-ups while ACP is busy are queued in memory (default depth 3) instead of hard-rejected. The queue is intentionally volatile across restarts; media follow-ups must wait for the active prompt.
 - **Interactive permissions**: choose **Allow once**, **Allow for session**, or the reject options offered by ACP. Resolved cards are replaced with their final status, and expired cards lose their buttons. Permissions are never approved automatically unless `AGENT_ALWAYS_APPROVE=true` (Grok prefers the session-scoped option; Copilot launches with `--allow-all`).
 - **Streaming responses**: throttled draft edits, ordered multi-message final responses, typing indicators, tool-progress bubbles, progress notices, plan cards, optional thought stream (`/verbose`), and stall recovery buttons.
-- **Single-poller protection**: a PID, hostname, process-start token, and heartbeat lock prevent competing bridge instances.
+- **Single-poller protection**: a kernel-held ownership lock prevents competing bridge instances; PID, hostname, process-start token, and heartbeat metadata provide diagnostics.
 - **Operational visibility**: `/status` and `health.json` report session, prompt, permission, queue, cwd, usage, and tool activity.
 - **Child environment minimization**: the Telegram token is omitted from the agent subprocess environment, and sensitive values are redacted from permission summaries and logs. This is not an OS sandbox; see [Security model and limitations](#security-model-and-limitations).
 
@@ -35,6 +35,8 @@ It does not expose an inbound HTTP server or Telegram webhook. Run one bridge in
 - A Telegram bot token from [@BotFather](https://t.me/BotFather)
 
 On Debian or Ubuntu, install the native build prerequisites with `sudo apt-get install -y python3 make g++`. On macOS, use `xcode-select --install` and install Python 3 with Homebrew if `python3 --version` is unavailable. Validate with `python3 --version`, `make --version`, and `c++ --version` before `npm ci`.
+
+The generated `dist/native/platform_security.node` is specific to the operating system and CPU architecture that built it. Run `npm ci` and `npm run build` on the deployment host. Do not copy `dist/native` or an `npm pack` tarball between Linux, macOS, ARM64, and x64 hosts. The source-build workflow requires development dependencies; `npm ci --omit=dev` cannot rebuild the addon.
 
 `STATE_DIR` must be on a local filesystem with working advisory `flock` semantics. Do not place bridge state on NFS, SMB, cloud-sync folders, or other network filesystems.
 

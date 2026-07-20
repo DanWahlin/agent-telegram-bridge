@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   chmodSync,
   existsSync,
+  linkSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -13,6 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import { Worker } from "node:worker_threads";
 import {
   acquireLock,
   buildHealthSnapshot,
@@ -43,9 +45,10 @@ import {
   cleanupInboxFiles,
   writeInboxFile,
 } from "./media.js";
+import { initializePlatformSecurity } from "./platform-security.js";
 
 function configFor(dir: string) {
-  return createTestConfig(dir, { LOCK_STALE_AFTER_MS: 1_000 });
+  return createTestConfig(dir);
 }
 
 describe("Telegram outbound queue", () => {
@@ -103,7 +106,7 @@ describe("pairing and state hardening", () => {
   });
 
   it("caps simultaneous pending pairing challenges", () => {
-    const config = createTestConfig(dir, { LOCK_STALE_AFTER_MS: 1_000, PAIRING_PENDING_MAX: 2 });
+    const config = createTestConfig(dir, { PAIRING_PENDING_MAX: 2 });
     ensureStateDir(config);
     const access: AccessState = { allowedUsers: [], pending: {} };
     startPairing(config, access, 1);
@@ -140,6 +143,34 @@ describe("pairing and state hardening", () => {
     removeLock(config, "second");
   });
 
+  it("reports an unsafe ownership inode as a lock security failure", () => {
+    const config = configFor(dir);
+    ensureStateDir(config);
+    acquireLock(config, "owner");
+    removeLock(config, "owner");
+    linkSync(join(dir, "lock.json.ownership"), join(dir, "ownership-alias"));
+
+    expect(() => acquireLock(config, "replacement"))
+      .toThrow(/Could not acquire bot ownership lock.*singly linked/);
+  });
+
+  it("rejects loading the lock addon in a second Node environment", async () => {
+    initializePlatformSecurity();
+    const addonPath = join(process.cwd(), "dist/native/platform_security.node");
+    const worker = new Worker(`
+      const { parentPort, workerData } = require('node:worker_threads');
+      try {
+        require(workerData);
+        parentPort.postMessage('unexpectedly-loaded');
+      } catch (error) {
+        parentPort.postMessage(String(error && error.message));
+      }
+    `, { eval: true, workerData: addonPath });
+    const [message] = await once(worker, "message") as [string];
+    await once(worker, "exit");
+    expect(message).toMatch(/primary Node environment/);
+  });
+
   it("recovers after owner crash without replacing the lock inode", async () => {
     const stateDir = join(dir, "contended");
     mkdirSync(stateDir, { recursive: true, mode: 0o700 });
@@ -149,7 +180,7 @@ describe("pairing and state hardening", () => {
       import { acquireLock, ensureStateDir, removeLock } from './src/state.ts';
       import { createTestConfig } from './src/test-support.ts';
       const id = process.env.TEST_LOCK_ID;
-      const config = createTestConfig(process.env.TEST_LOCK_DIR, { LOCK_STALE_AFTER_MS: 5000 });
+      const config = createTestConfig(process.env.TEST_LOCK_DIR);
       ensureStateDir(config);
       try {
         acquireLock(config, id);
@@ -172,9 +203,12 @@ describe("pairing and state hardening", () => {
       child.stdout?.on("data", (chunk: Buffer) => { output += chunk.toString(); });
       child.stderr?.on("data", (chunk: Buffer) => { errorOutput += chunk.toString(); });
       child.on("error", reject);
-      child.on("close", () => {
-        if (errorOutput) reject(new Error(errorOutput));
-        else resolve(output);
+      child.on("close", (code, signal) => {
+        if (code !== 0) {
+          reject(new Error(errorOutput || `Lock contender exited with code ${code} signal ${signal}`));
+        } else {
+          resolve(output);
+        }
       });
     });
 

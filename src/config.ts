@@ -33,7 +33,6 @@ const EnvSchema = z.object({
   PAIRING_EXPIRY_MS: z.coerce.number().int().positive().default(5 * 60 * 1000),
   PAIRING_PENDING_MAX: z.coerce.number().int().positive().max(1000).default(100),
   PERMISSION_TIMEOUT_MS: z.coerce.number().int().positive().default(5 * 60 * 1000),
-  LOCK_STALE_AFTER_MS: z.coerce.number().int().positive().default((30 + 60 + 45) * 1000),
   PROMPT_STALE_AFTER_MS: z.coerce.number().int().positive().default(15 * 60 * 1000),
   MAX_TYPING_SESSION_MS: z.coerce.number().int().positive().default(30 * 60 * 1000),
   STREAM_EDIT_INTERVAL_MS: z.coerce.number().int().positive().default(1500),

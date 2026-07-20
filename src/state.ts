@@ -279,11 +279,17 @@ export function acquireLock(config: Config, sessionId: string): void {
   try {
     token = acquireOwnershipLock(ownershipLockPath(config));
   } catch (error: unknown) {
-    const existing = readLock(config);
-    const owner = existing
-      ? ` by pid ${existing.pid} on ${existing.hostname}`
+    const code = error && typeof error === "object" && "code" in error
+      ? String((error as { code?: unknown }).code)
       : "";
-    throw new Error(`Bot is already locked${owner}: ${sanitizedError(error)}`);
+    if (code === "OWNERSHIP_LOCK_HELD") {
+      const existing = readLock(config);
+      const owner = existing
+        ? ` by pid ${existing.pid} on ${existing.hostname}`
+        : "";
+      throw new Error(`Bot is already locked${owner}: ${sanitizedError(error)}`);
+    }
+    throw new Error(`Could not acquire bot ownership lock: ${sanitizedError(error)}`);
   }
   const lease: OwnershipLease = { token, sessionId };
   ownershipLeases.set(path, lease);

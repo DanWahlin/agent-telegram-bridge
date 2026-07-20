@@ -27,6 +27,7 @@ execFileSync(process.execPath, [nodeGyp, "rebuild", "--directory", nativeRoot], 
   stdio: "inherit",
 });
 mkdirSync(outputDir, { recursive: true, mode: 0o755 });
+rmSync(packagedAddon, { force: true });
 copyFileSync(builtAddon, packagedAddon);
 chmodSync(packagedAddon, 0o555);
 rmSync(resolve(nativeRoot, "build"), { recursive: true, force: true });

@@ -1,5 +1,7 @@
 #include <node_api.h>
+#include <errno.h>
 #include <stdint.h>
+#include <string.h>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -9,9 +11,10 @@
 #ifdef __APPLE__
 #include <limits.h>
 #include <libproc.h>
-#include <string.h>
 #endif
 
+#include <mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -19,10 +22,28 @@ namespace {
 
 std::unordered_map<uint64_t, int> lock_descriptors;
 uint64_t next_lock_token = 1;
+std::mutex lock_mutex;
+napi_env primary_env = nullptr;
 
 napi_value Throw(napi_env env, const char* message) {
   napi_throw_error(env, nullptr, message);
   return nullptr;
+}
+
+napi_value ThrowErrno(napi_env env, const char* code, const char* operation, int error_number) {
+  const std::string message = std::string(operation) + ": " + strerror(error_number);
+  napi_throw_error(env, code, message.c_str());
+  return nullptr;
+}
+
+void CleanupEnvironment(void*) {
+  std::lock_guard<std::mutex> guard(lock_mutex);
+  for (const auto& entry : lock_descriptors) {
+    flock(entry.second, LOCK_UN);
+    close(entry.second);
+  }
+  lock_descriptors.clear();
+  primary_env = nullptr;
 }
 
 bool ReadString(napi_env env, napi_value value, std::vector<char>* output) {
@@ -49,31 +70,52 @@ napi_value AcquireLock(napi_env env, napi_callback_info info) {
   }
 
   const int fd = open(path.data(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
-  if (fd < 0) return Throw(env, "Could not open ownership lock file");
+  if (fd < 0) {
+    const int error_number = errno;
+    return ThrowErrno(env, "OWNERSHIP_LOCK_OPEN_FAILED", "Could not open ownership lock file", error_number);
+  }
 
   struct stat opened{};
-  if (fstat(fd, &opened) != 0 || !S_ISREG(opened.st_mode)
-      || opened.st_nlink != 1 || opened.st_uid != geteuid()) {
+  if (fstat(fd, &opened) != 0) {
+    const int error_number = errno;
+    close(fd);
+    return ThrowErrno(env, "OWNERSHIP_LOCK_STAT_FAILED", "Could not inspect ownership lock file", error_number);
+  }
+  if (!S_ISREG(opened.st_mode) || opened.st_nlink != 1 || opened.st_uid != geteuid()) {
     close(fd);
     return Throw(env, "Ownership lock must be a singly linked owner-controlled regular file");
   }
   if (fchmod(fd, 0600) != 0) {
+    const int error_number = errno;
     close(fd);
-    return Throw(env, "Could not enforce ownership lock permissions");
+    return ThrowErrno(env, "OWNERSHIP_LOCK_MODE_FAILED", "Could not enforce ownership lock permissions", error_number);
   }
   if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+    const int error_number = errno;
     close(fd);
-    return Throw(env, "Ownership lock is already held");
+    const char* code = (error_number == EWOULDBLOCK || error_number == EAGAIN)
+      ? "OWNERSHIP_LOCK_HELD"
+      : "OWNERSHIP_LOCK_FLOCK_FAILED";
+    return ThrowErrno(env, code, "Could not acquire ownership lock", error_number);
   }
 
-  uint64_t token = next_lock_token++;
-  if (token == 0) token = next_lock_token++;
-  lock_descriptors.emplace(token, fd);
+  uint64_t token = 0;
+  {
+    std::lock_guard<std::mutex> guard(lock_mutex);
+    do {
+      token = next_lock_token++;
+      if (next_lock_token == 0) next_lock_token = 1;
+    } while (token == 0 || lock_descriptors.find(token) != lock_descriptors.end());
+    lock_descriptors.emplace(token, fd);
+  }
   napi_value result;
   if (napi_create_bigint_uint64(env, token, &result) != napi_ok) {
+    {
+      std::lock_guard<std::mutex> guard(lock_mutex);
+      lock_descriptors.erase(token);
+    }
     flock(fd, LOCK_UN);
     close(fd);
-    lock_descriptors.erase(token);
     return Throw(env, "Could not create ownership lock token");
   }
   return result;
@@ -90,14 +132,24 @@ napi_value ReleaseLock(napi_env env, napi_callback_info info) {
   if (napi_get_value_bigint_uint64(env, args[0], &token, &lossless) != napi_ok || !lossless) {
     return Throw(env, "platform_security.releaseLock received an invalid token");
   }
-  const auto entry = lock_descriptors.find(token);
-  if (entry == lock_descriptors.end()) return Throw(env, "Ownership lock token is not active");
-  const int fd = entry->second;
-  lock_descriptors.erase(entry);
-  const int unlock_result = flock(fd, LOCK_UN);
-  const int close_result = close(fd);
-  if (unlock_result != 0 || close_result != 0) {
-    return Throw(env, "Could not release ownership lock");
+  int fd = -1;
+  {
+    std::lock_guard<std::mutex> guard(lock_mutex);
+    const auto entry = lock_descriptors.find(token);
+    if (entry == lock_descriptors.end()) {
+      return Throw(env, "Ownership lock token is not active");
+    }
+    fd = entry->second;
+    lock_descriptors.erase(entry);
+  }
+  if (flock(fd, LOCK_UN) != 0) {
+    const int error_number = errno;
+    close(fd);
+    return ThrowErrno(env, "OWNERSHIP_LOCK_RELEASE_FAILED", "Could not unlock ownership lock", error_number);
+  }
+  if (close(fd) != 0) {
+    const int error_number = errno;
+    return ThrowErrno(env, "OWNERSHIP_LOCK_CLOSE_FAILED", "Could not close ownership lock", error_number);
   }
   napi_value result;
   napi_get_undefined(env, &result);
@@ -176,6 +228,19 @@ napi_value Inspect(napi_env env, napi_callback_info info) {
 }
 
 napi_value Init(napi_env env, napi_value exports) {
+  {
+    std::lock_guard<std::mutex> guard(lock_mutex);
+    if (primary_env != nullptr && primary_env != env) {
+      return Throw(env, "Platform security addon may only be loaded in its primary Node environment");
+    }
+    if (primary_env == nullptr) {
+      primary_env = env;
+      if (napi_add_env_cleanup_hook(env, CleanupEnvironment, nullptr) != napi_ok) {
+        primary_env = nullptr;
+        return Throw(env, "Could not register platform security cleanup hook");
+      }
+    }
+  }
   napi_property_descriptor properties[] = {
     {"acquireLock", nullptr, AcquireLock, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"releaseLock", nullptr, ReleaseLock, nullptr, nullptr, nullptr, napi_default, nullptr},

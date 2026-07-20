@@ -940,8 +940,8 @@ export function createBridge(config: Config, factories: BridgeFactories = {}): B
       lifecycleCompromised = true;
       throw new AggregateError(teardownErrors, "Bridge shutdown did not complete safely");
     }
-    removeLock(config, sessionIdForLock);
     writeHealthSnapshot(config, "shutdown", buildExtra(), { force: true });
+    removeLock(config, sessionIdForLock);
   }
 
   return { start, shutdown };
