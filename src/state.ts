@@ -13,7 +13,12 @@ import { z, type ZodType } from "zod";
 import type { PermissionOption, RequestPermissionResponse } from "@agentclientprotocol/sdk";
 import type { Config } from "./config.js";
 import type { InboxFile } from "./media.js";
-import { nowIso, parseTimeMs, ageMs, messageSafeRandom } from "./utils.js";
+import {
+  acquireOwnershipLock,
+  getProcessStartToken,
+  releaseOwnershipLock,
+} from "./platform-security.js";
+import { nowIso, ageMs, messageSafeRandom } from "./utils.js";
 import { sanitizedError, sanitizePermissionText } from "./redact.js";
 
 export interface AccessState {
@@ -234,29 +239,30 @@ export function completePairing(
 
 // --- Lock management ---
 
-function getProcessStartToken(pid: number): string | null {
-  if (platform() !== "linux") return null;
-  try {
-    const stat = readFileSync(`/proc/${pid}/stat`, "utf-8");
-    const lastParen = stat.lastIndexOf(")");
-    if (lastParen === -1) return null;
-    const fields = stat.slice(lastParen + 2).trim().split(/\s+/);
-    const startTime = fields[19];
-    return startTime ? `linux:${startTime}` : null;
-  } catch {
-    return null;
-  }
+interface OwnershipLease {
+  token: bigint;
+  sessionId: string;
+}
+
+const ownershipLeases = new Map<string, OwnershipLease>();
+
+function ownershipLockPath(config: Config): string {
+  return `${lockPath(config)}.ownership`;
 }
 
 export function createLockData(
   sessionId: string,
   connectedAt = nowIso()
 ): LockData {
+  const processStartToken = getProcessStartToken(process.pid);
+  if (!processStartToken) {
+    throw new Error(`Could not prove process start identity on ${platform()}`);
+  }
   return {
     pid: process.pid,
     sessionId,
     hostname: hostname(),
-    processStartToken: getProcessStartToken(process.pid),
+    processStartToken,
     processStartTokenSource: platform(),
     connectedAt,
     updatedAt: nowIso(),
@@ -266,20 +272,28 @@ export function createLockData(
 export function acquireLock(config: Config, sessionId: string): void {
   const path = lockPath(config);
   const data = createLockData(sessionId);
+  if (ownershipLeases.has(path)) {
+    throw new Error("Bot is already locked by this process");
+  }
+  let token: bigint;
   try {
-    writeFileSync(path, JSON.stringify(data, null, 2) + "\n", { mode: 0o600, flag: "wx" });
-    chmodSync(path, 0o600);
-    return;
+    token = acquireOwnershipLock(ownershipLockPath(config));
   } catch (error: unknown) {
-    if (!isErrnoException(error) || error.code !== "EEXIST") throw error;
+    const existing = readLock(config);
+    const owner = existing
+      ? ` by pid ${existing.pid} on ${existing.hostname}`
+      : "";
+    throw new Error(`Bot is already locked${owner}: ${sanitizedError(error)}`);
   }
-  const existing = readLock(config);
-  if (existing && !isLockStale(config, existing)) {
-    throw new Error(`Bot is already locked by pid ${existing.pid} on ${existing.hostname}`);
+  const lease: OwnershipLease = { token, sessionId };
+  ownershipLeases.set(path, lease);
+  try {
+    saveJsonAtomic(path, data, 0o600);
+  } catch (error: unknown) {
+    ownershipLeases.delete(path);
+    releaseOwnershipLock(lease.token);
+    throw error;
   }
-  rmSync(path, { force: true });
-  writeFileSync(path, JSON.stringify(data, null, 2) + "\n", { mode: 0o600, flag: "wx" });
-  chmodSync(path, 0o600);
 }
 
 export function readLock(config: Config): LockData | null {
@@ -295,12 +309,14 @@ export function lockOwnedByCurrentProcess(lock: LockData | null, sessionId: stri
   if (lock.hostname && lock.hostname !== hostname()) return false;
   if (lock.processStartToken) {
     const current = getProcessStartToken(lock.pid);
-    if (current && current !== lock.processStartToken) return false;
+    if (!current || current !== lock.processStartToken) return false;
   }
   return true;
 }
 
 export function refreshLock(config: Config, sessionId: string): boolean {
+  const lease = ownershipLeases.get(lockPath(config));
+  if (!lease || lease.sessionId !== sessionId) return false;
   const lock = readLock(config);
   if (!lock || !lockOwnedByCurrentProcess(lock, sessionId)) return false;
   const connectedAt = lock.connectedAt || nowIso();
@@ -309,34 +325,24 @@ export function refreshLock(config: Config, sessionId: string): boolean {
 }
 
 export function removeLock(config: Config, sessionId: string): void {
+  const path = lockPath(config);
+  const lease = ownershipLeases.get(path);
+  if (!lease || lease.sessionId !== sessionId) return;
   const lock = readLock(config);
-  if (lockOwnedByCurrentProcess(lock, sessionId)) {
+  try {
+    if (lockOwnedByCurrentProcess(lock, sessionId)) {
+      rmSync(path, { force: true });
+    }
+  } catch (error: unknown) {
+    console.warn(`agent-telegram: failed to remove lock metadata: ${sanitizedError(error)}`);
+  } finally {
+    ownershipLeases.delete(path);
     try {
-      rmSync(lockPath(config), { force: true });
+      releaseOwnershipLock(lease.token);
     } catch (error: unknown) {
-      console.warn(`agent-telegram: failed to remove lock: ${sanitizedError(error)}`);
+      console.warn(`agent-telegram: failed to release ownership lock: ${sanitizedError(error)}`);
     }
   }
-}
-
-export function isLockStale(config: Config, lock: LockData | null): boolean {
-  if (!lock) return true;
-  const updatedAt = parseTimeMs(lock.updatedAt || lock.connectedAt);
-  if (!Number.isFinite(updatedAt)) return true;
-  const heartbeatExpired = Date.now() - (updatedAt as number) > config.LOCK_STALE_AFTER_MS;
-
-  if (lock.hostname && lock.hostname !== hostname()) return heartbeatExpired;
-
-  try {
-    process.kill(lock.pid, 0);
-  } catch {
-    return true;
-  }
-  if (lock && lock.processStartToken) {
-    const current = getProcessStartToken(lock.pid);
-    if (current && current !== lock.processStartToken) return true;
-  }
-  return false;
 }
 
 // --- Health ---
@@ -379,7 +385,7 @@ export interface QueuedPromptState {
   messageId: number;
   text: string;
   replyContext: string | null;
-  /** In-memory descriptor identity captured after download. */
+  /** In-memory admitted attachment leases. */
   inboxFiles: InboxFile[];
   enqueuedAt: string;
 }
@@ -599,6 +605,14 @@ export function resetSessionUiState(): void {
 
 /** Test helper to reset module-level runtime state. */
 export function resetRuntimeStateForTests(): void {
+  for (const [path, lease] of ownershipLeases) {
+    try {
+      releaseOwnershipLock(lease.token);
+    } catch {
+      // Tests may deliberately compromise or remove a lock.
+    }
+    ownershipLeases.delete(path);
+  }
   activePrompt = null;
   pendingPermission = null;
   typingStartedAt = null;

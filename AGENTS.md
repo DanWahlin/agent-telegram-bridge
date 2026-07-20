@@ -28,6 +28,8 @@ This project is a security-sensitive bridge between one private Telegram owner a
 | `src/state.ts` | Pairing, authorization, locks, runtime state, and health snapshots |
 | `src/config.ts` | Environment parsing and runtime configuration |
 | `src/path-safety.ts` | Canonical path guards that keep runtime state and workspaces outside disposable build output |
+| `src/platform-security.ts` | Linux `/proc` and Darwin native-addon process/CWD identity adapters |
+| `src/launch-env.ts` | Owner-only, descriptor-stable dotenv loading for launchd |
 | `src/redact.ts` | Sanitization for logs and permission text |
 | `src/utils.ts` | Small shared time and random-value helpers |
 | `src/media.ts` | Attachment MIME/root helpers, inbox files, and ACP content blocks |
@@ -36,6 +38,8 @@ This project is a security-sensitive bridge between one private Telegram owner a
 | `scripts/smoke-acp.ts` | Live ACP smoke test without Telegram |
 | `deploy/systemd/agent-telegram@.service` | Shared systemd instance template for one provider/bot per service |
 | `deploy/systemd/copilot.env.example` | Redacted production-style Copilot instance configuration |
+| `deploy/launchd/` | Native macOS LaunchAgent template and redacted environment example |
+| `native/platform_security.cc` | Package-owned Node-API addon for kernel `flock` ownership plus Darwin `libproc` process/CWD identity |
 
 ## Current production deployment
 
@@ -68,14 +72,15 @@ Never add `--model` for Copilot. Never print or commit `/etc/agent-telegram/copi
 - Launch subprocesses with `shell: false`; do not construct shell command strings from user input.
 - Build every agent launch through `buildAgentLaunch` in `src/agent-launch.ts`. Never pass `--model` to Copilot. Only the Grok child env forces `GROK_CLAUDE_MCPS_ENABLED=false` and `GROK_CLAUDE_HOOKS_ENABLED=false`.
 - Preserve atomic state writes, state-directory symlink refusal, `0700` directory mode, and `0600` file mode.
-- Preserve the one-poller ownership lock and verify ownership before refreshing or removing it.
+- Preserve the one-poller kernel `flock` on the persistent `lock.json.ownership` inode. Never delete or replace that inode during live operation or crash recovery; the kernel releases ownership when the process exits.
+- Supported hosts are native Linux, native macOS, and Windows through WSL2. Native Windows remains unsupported. Linux process/CWD identity must continue using `/proc`. macOS must load the package-owned Darwin `proc_pidinfo` addon before ACP spawn, with bracketed process-start checks and direct CWD vnode device/inode values. Never authorize from `lsof`, `ps`, `realpath`, or a pathname, and never downgrade when native inspection fails.
 - After every completed or failed prompt, persist a fresh health snapshot after clearing prompt ownership. A healthy completed turn has `activePrompt: null`, `reason: prompt-idle`, and `likelyState: healthy/idle`; do not infer a live hang from a stale snapshot.
 - Route Telegram API operations through the shared paced queue so ordering and rate-limit handling stay consistent.
 - Escape agent output before Telegram HTML rendering and allow only explicitly supported link schemes.
 - Sanitize errors before logging or sending them to Telegram.
 - Do not silently swallow failures in required delivery or permission paths. Cleanup may be best effort, but failures should be safely logged.
 - Keep automatic tool approval disabled by default.
-- Media ingress: owner + private chat before download; MIME allowlist + size cap; inbox under session CWD with owner-only perms; after the prompt, erase and permission-lock the exact admitted opened file before closing its descriptor. Do not unlink a reusable pathname during live cleanup; empty placeholders may remain until offline maintenance.
+- Media ingress: owner + private chat before download; MIME allowlist + size cap. Linux uses the owner-only session-CWD inbox, retained descriptors, and descriptor cleanup. macOS uses in-memory leases, inline ACP blocks, opaque digest URNs, and buffer zeroing. Never emit a Darwin local path, `/dev/fd`, `file://`, or fallback `resource_link`; reject media when the agent lacks a compatible inline capability.
 - Keep automatic outbound local-file delivery disabled until ACP exposes a narrow, typed artifact contract.
 - Serialize ACP prompts (one in flight). Telegram-side queue is allowed; do not open a second ACP prompt concurrently.
 - `/cwd` may only switch to paths in the configured allowlist.
@@ -122,6 +127,8 @@ Use `npm run smoke` only when a local, authenticated agent CLI is available. It 
 - Use `src/test-support.ts` for complete test configuration instead of scattered partial `Config` casts.
 - Every security fix or externally visible behavior change needs a focused regression test.
 - Tests must not call the real Telegram API or require live credentials.
+- Darwin tests must cover addon result validation, CWD device/inode mismatch, token inspection failure, path-free inline media, capability rejection, buffer zeroing, and hardened LaunchAgent environment loading.
+- Linux-only mocks are not native macOS proof. Before calling a Mac deployment verified, run the complete gate and ACP smoke on that Mac, compile and exercise the native addon against a real child, validate the plist with `plutil`, test launchd bootstrap/unload and descendant teardown, send real inline attachments, and prove lock restart recovery.
 
 ## Change checklist
 
@@ -147,6 +154,7 @@ When changing state or configuration:
 When changing deployment or provider launch behavior:
 
 - Keep `deploy/systemd/agent-telegram@.service`, its environment examples, and the README commands aligned with production.
+- Keep `deploy/launchd/`, the plist renderer, native addon build, and macOS README commands aligned. Launchd secrets belong in a singly linked owner-only dotenv file, never the plist or shell code.
 - Validate the unit with `systemd-analyze verify` and compare the checked-in template with the installed unit when working on this host.
 - Prove exactly one poller owns each bot token before and after a cutover.
 - Verify the exact child argv from the live systemd cgroup. Copilot must have no `--model`; Grok model selection remains explicit configuration.

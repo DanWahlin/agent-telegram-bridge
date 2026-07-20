@@ -1,12 +1,17 @@
 import { spawn } from "node:child_process";
 import { resolve } from "node:path";
 import { Readable, Writable } from "node:stream";
+import { once } from "node:events";
 import * as acp from "@agentclientprotocol/sdk";
 import { buildAgentLaunch } from "../src/agent-launch.js";
 import { parseEnvironment, resolveAgentBinary, DEFAULT_DISPLAY_NAMES, type Config } from "../src/config.js";
+import { captureRootIdentity } from "../src/media.js";
+import { initializePlatformSecurity, verifyProcessCwdIdentity } from "../src/platform-security.js";
 
+initializePlatformSecurity();
 const parsed = parseEnvironment(process.env);
 const sessionCwd = resolve(parsed.AGENT_CWD);
+const sessionRoot = captureRootIdentity(sessionCwd);
 const agentBin = resolveAgentBinary(parsed.AGENT_PROVIDER, parsed.AGENT_BIN, process.env["HOME"]);
 
 // Minimal Config projection sufficient for the launch builder.
@@ -25,6 +30,13 @@ const child = spawn(launch.command, launch.args, {
   env: launch.env,
   shell: false,
 });
+await once(child, "spawn");
+try {
+  verifyProcessCwdIdentity(child.pid, sessionRoot);
+} catch (error) {
+  child.kill("SIGKILL");
+  throw error;
+}
 const timeout = setTimeout(() => {
   child.kill("SIGTERM");
   console.error("Live ACP smoke timed out");

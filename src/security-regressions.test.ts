@@ -133,7 +133,57 @@ describe("pairing and state hardening", () => {
     acquireLock(config, "first");
     expect(readLock(config)?.sessionId).toBe("first");
     expect(() => acquireLock(config, "second")).toThrow(/already locked/);
+    removeLock(config, "wrong-session");
+    expect(() => acquireLock(config, "second")).toThrow(/already locked/);
     removeLock(config, "first");
+    acquireLock(config, "second");
+    removeLock(config, "second");
+  });
+
+  it("recovers after owner crash without replacing the lock inode", async () => {
+    const stateDir = join(dir, "contended");
+    mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+    const ownershipDir = join(stateDir, "lock.json.ownership");
+
+    const code = `
+      import { acquireLock, ensureStateDir, removeLock } from './src/state.ts';
+      import { createTestConfig } from './src/test-support.ts';
+      const id = process.env.TEST_LOCK_ID;
+      const config = createTestConfig(process.env.TEST_LOCK_DIR, { LOCK_STALE_AFTER_MS: 5000 });
+      ensureStateDir(config);
+      try {
+        acquireLock(config, id);
+        process.stdout.write('ACQUIRED:' + id + '\\n');
+        if (process.env.TEST_LOCK_MODE === 'crash') process.exit(0);
+        setTimeout(() => { removeLock(config, id); process.exit(0); }, 300);
+      } catch {
+        process.stdout.write('REJECTED:' + id + '\\n');
+        process.exit(0);
+      }
+    `;
+    const contend = (id: string, mode = "hold") => new Promise<string>((resolve, reject) => {
+      const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", code], {
+        cwd: process.cwd(),
+        env: { ...process.env, TEST_LOCK_DIR: stateDir, TEST_LOCK_ID: id, TEST_LOCK_MODE: mode },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let output = "";
+      let errorOutput = "";
+      child.stdout?.on("data", (chunk: Buffer) => { output += chunk.toString(); });
+      child.stderr?.on("data", (chunk: Buffer) => { errorOutput += chunk.toString(); });
+      child.on("error", reject);
+      child.on("close", () => {
+        if (errorOutput) reject(new Error(errorOutput));
+        else resolve(output);
+      });
+    });
+
+    expect(await contend("crashed", "crash")).toContain("ACQUIRED:crashed");
+    const inode = statSync(ownershipDir).ino;
+    const outcomes = await Promise.all([contend("one"), contend("two")]);
+    expect(outcomes.filter((outcome) => outcome.includes("ACQUIRED:"))).toHaveLength(1);
+    expect(outcomes.filter((outcome) => outcome.includes("REJECTED:"))).toHaveLength(1);
+    expect(statSync(ownershipDir).ino).toBe(inode);
   });
 
   it("falls back safely when state JSON has the wrong shape", () => {
@@ -333,7 +383,7 @@ describe("ACP process ownership", () => {
   });
 
   it("proves the spawned process is running in the authorized directory identity", async () => {
-    if (process.platform !== "linux") return;
+    if (process.platform !== "linux" && process.platform !== "darwin") return;
     const parent = mkdtempSync(join(tmpdir(), "grok-tg-process-cwd-"));
     const allowed = join(parent, "allowed");
     const other = join(parent, "other");

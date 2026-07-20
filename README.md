@@ -14,7 +14,7 @@ It does not expose an inbound HTTP server or Telegram webhook. Run one bridge in
 ## Features
 
 - **Secure by default**: private chats only, one numeric Telegram owner, expiring attempt-limited pairing codes, and atomic owner-only state files.
-- **Multimodal prompts**: text, photos, documents, voice, and video are downloaded into a descriptor-bound, owner-only inbox under the authorized session CWD. Inbox paths are opened without following symlinks, and admitted file identity, size, and content digest are revalidated before use. Files are sent as ACP content blocks when supported, otherwise as a `resource_link` backed by a process-owned file descriptor that remains open only for the prompt lifetime.
+- **Multimodal prompts**: Linux downloads media into a descriptor-bound, owner-only inbox and exposes retained descriptors through `/proc`. macOS keeps media in an in-memory lease and sends only inline ACP image, audio, or embedded-resource blocks with opaque URNs; it never hands the agent a local attachment path. Agents that do not advertise a compatible inline capability receive a clear rejection on macOS.
 - **Prompt queue**: text follow-ups while ACP is busy are queued in memory (default depth 3) instead of hard-rejected. The queue is intentionally volatile across restarts; media follow-ups must wait for the active prompt.
 - **Interactive permissions**: choose **Allow once**, **Allow for session**, or the reject options offered by ACP. Resolved cards are replaced with their final status, and expired cards lose their buttons. Permissions are never approved automatically unless `AGENT_ALWAYS_APPROVE=true` (Grok prefers the session-scoped option; Copilot launches with `--allow-all`).
 - **Streaming responses**: throttled draft edits, ordered multi-message final responses, typing indicators, tool-progress bubbles, progress notices, plan cards, optional thought stream (`/verbose`), and stall recovery buttons.
@@ -24,12 +24,21 @@ It does not expose an inbound HTTP server or Telegram webhook. Run one bridge in
 
 ## Requirements
 
-- Linux with a mounted `/proc` filesystem. The bridge verifies the spawned ACP process through `/proc/<pid>/cwd` and fails closed when that identity proof is unavailable.
+- A supported host:
+  - **Linux** with a mounted `/proc` filesystem, Python 3, `make`, and a C++ compiler
+  - **macOS native preview** with Apple Command Line Tools and Python 3 for `node-gyp`; the project build compiles a small package-owned Node-API addon backed by `libproc`
+  - **Windows through WSL2**; native Windows is intentionally rejected
 - Node.js 24 or later
 - One locally installed and authenticated agent CLI:
   - Grok CLI with access to the `grok-4.5` model, or
-  - GitHub Copilot CLI at `/usr/bin/copilot` (or set `AGENT_BIN`) with ACP support
+  - GitHub Copilot CLI with ACP support (`/usr/bin/copilot` by default on Linux, `copilot` from `PATH` on macOS, or set `AGENT_BIN`)
 - A Telegram bot token from [@BotFather](https://t.me/BotFather)
+
+On Debian or Ubuntu, install the native build prerequisites with `sudo apt-get install -y python3 make g++`. On macOS, use `xcode-select --install` and install Python 3 with Homebrew if `python3 --version` is unavailable. Validate with `python3 --version`, `make --version`, and `c++ --version` before `npm ci`.
+
+`STATE_DIR` must be on a local filesystem with working advisory `flock` semantics. Do not place bridge state on NFS, SMB, cloud-sync folders, or other network filesystems.
+
+The macOS implementation is security-gated in code and covered by cross-platform tests, but it has not yet been compiled or exercised on a real Mac from this project. Treat it as preview support until the native build, `proc_pidinfo`, launchd lifecycle, descendant teardown, lock recovery, ACP smoke, and Telegram attachment checks below pass on the target Mac.
 
 ## Quick start
 
@@ -73,7 +82,7 @@ npm start
 
 Run only one bridge process per bot token. Use one instance per provider (separate token and `STATE_DIR`). Use a process supervisor if the bridge must restart automatically.
 
-### systemd instance
+### Linux systemd instance
 
 The checked-in template runs one isolated service per provider/bot:
 
@@ -92,6 +101,58 @@ sudo systemctl enable --now agent-telegram@copilot.service
 ```
 
 The template assumes this repository is `/root/projects/agent-telegram-bridge` and runs as `root`; edit the unit for another path or service identity. Never start the legacy and shared bridges with the same Telegram token. Verify `health.json`, the ownership-lock PID, and the exact ACP child arguments after every cutover.
+
+### macOS launchd instance
+
+The build compiles `native/platform_security.cc` as a Node-API addon on Linux and macOS. The addon holds the singleton poller lock through a kernel `flock` on a persistent inode. On macOS, the bridge also loads and exercises its Darwin inspection code before starting any ACP child. That code calls `proc_pidinfo` directly to read microsecond-resolution process-start identity and current-directory vnode device/inode values in one bracketed inspection. It does not authorize from a pathname, `lsof`, or `ps` output.
+
+Install Apple Command Line Tools if needed, then verify prerequisites:
+
+```bash
+xcode-select -p || xcode-select --install
+/usr/bin/clang --version
+python3 --version
+node --version
+command -v copilot   # or: command -v grok
+```
+
+Install, build the TypeScript and native addon, and create the owner-only dotenv file:
+
+```bash
+npm ci
+npm run build
+mkdir -p "$HOME/.config/agent-telegram" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
+cp deploy/launchd/copilot.env.example "$HOME/.config/agent-telegram/copilot.env"
+chmod -N "$HOME/.config/agent-telegram/copilot.env"  # remove inherited ACL entries
+chmod 600 "$HOME/.config/agent-telegram/copilot.env"
+ls -le "$HOME/.config/agent-telegram/copilot.env"
+```
+
+Replace every placeholder in the environment file. Set `AGENT_BIN` to the result of `command -v copilot` or `command -v grok`. The LaunchAgent plist contains no token; the compiled launcher opens the dotenv file with `O_NOFOLLOW`, verifies owner/mode/link and descriptor identity, then parses it without invoking a shell.
+
+Render and validate the plist from the repository root:
+
+```bash
+npm run render:launchd -- \
+  --node "$(command -v node)" \
+  --repo "$PWD" \
+  --env "$HOME/.config/agent-telegram/copilot.env" \
+  --home "$HOME" \
+  --output "$HOME/Library/LaunchAgents/com.codewithdan.agent-telegram.copilot.plist"
+plutil -lint "$HOME/Library/LaunchAgents/com.codewithdan.agent-telegram.copilot.plist"
+```
+
+Load and inspect the service:
+
+```bash
+launchctl bootout "gui/$(id -u)/com.codewithdan.agent-telegram.copilot" 2>/dev/null || true
+launchctl bootstrap "gui/$(id -u)" \
+  "$HOME/Library/LaunchAgents/com.codewithdan.agent-telegram.copilot.plist"
+launchctl enable "gui/$(id -u)/com.codewithdan.agent-telegram.copilot"
+launchctl print "gui/$(id -u)/com.codewithdan.agent-telegram.copilot"
+```
+
+Logs are written under `~/Library/Logs/`. Before calling a Mac deployment verified, run the full test suite and `npm run smoke`, send a real Telegram prompt and attachment, then confirm `health.json` returns to `activePrompt: null` and `likelyState: healthy/idle`.
 
 ### Current Copilot deployment on this host
 
@@ -206,7 +267,7 @@ flowchart LR
 
 - `grammY` long-polls Telegram. No webhook endpoint is opened.
 - Prompts are serialized to ACP. Follow-ups enqueue on the Telegram side.
-- Attachments land in `<CWD>/.tg-inbox/` (directory mode `0700`, active file mode `0600`) and are securely retired after the prompt finishes, as described below.
+- On Linux, attachments land in `<CWD>/.tg-inbox/` (directory mode `0700`, active file mode `0600`). On macOS, attachments remain in memory and are sent only through compatible inline ACP blocks.
 - Assistant output is HTML-escaped, rendered from a limited Markdown subset, and split at Telegram's message limit.
 - Tool and permission controls are sent only to the authorized chat that owns the active prompt.
 - Outbound Telegram operations share one paced queue with retry handling for rate limits.
@@ -218,12 +279,17 @@ The bridge creates these files under `STATE_DIR`:
 | File | Contents |
 | --- | --- |
 | `access.json` | Authorized user ID and temporary pairing state |
-| `lock.json` | Single-poller ownership and heartbeat |
+| `lock.json` | Human-readable poller ownership metadata |
+| `lock.json.ownership` | Persistent regular file whose open descriptor holds the kernel `flock` singleton lease |
 | `health.json` | Current bridge, Telegram, ACP, prompt, and permission status |
 
 The state directory is forced to mode `0700` and state files to `0600`. Do not commit or share them.
 
-Inbox files for media live under `<session CWD>/.tg-inbox/` (not `STATE_DIR`). The inbox is forced to mode `0700`. After a prompt settles, the bridge erases each admitted opened file, removes its permissions, and closes its retained descriptor without unlinking a reusable pathname. Empty retired entries can remain, and an abrupt process death can leave an admitted file intact; inspect and remove leftovers only while the bridge is stopped.
+On Linux, inbox files for media live under `<session CWD>/.tg-inbox/` (not `STATE_DIR`). The inbox is forced to mode `0700`. After a prompt settles, the bridge erases each admitted opened file, removes its permissions, and closes its retained descriptor without unlinking a reusable pathname. Empty retired entries can remain, and an abrupt process death can leave an admitted file intact; inspect and remove leftovers only while the bridge is stopped.
+
+That disk-backed inbox is Linux-only. macOS retains attachment bytes in memory, uses `urn:agent-telegram:sha256:<digest>` identifiers, and zeroes the retained buffer during cleanup. It never emits `/proc`, `/dev/fd`, `file://`, a workspace path, or a fallback `resource_link` for a macOS attachment.
+
+Buffer zeroing retires the bridge-owned macOS lease. Base64 or text copies already created inside V8 or the ACP SDK cannot be guaranteed to be overwritten before garbage collection.
 
 ## Security model and limitations
 
@@ -243,7 +309,7 @@ Inbox files for media live under `<session CWD>/.tg-inbox/` (not `STATE_DIR`). T
 
 **The bot reports another poller or exits with a conflict**
 
-Another process is using the same bot token. Stop the other process before restarting this bridge. Do not delete `lock.json` while a bridge process is still running.
+Another process is using the same bot token. Stop the other process before restarting this bridge. Do not delete or replace `lock.json.ownership` while a bridge process is running. The kernel releases its advisory lock automatically when the owner exits or crashes; normal recovery never deletes the lock file.
 
 **No pairing code appears in Telegram**
 
