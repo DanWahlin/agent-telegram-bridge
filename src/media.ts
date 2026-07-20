@@ -13,10 +13,13 @@ import {
   constants,
 } from "node:fs";
 import { basename, extname, join, resolve } from "node:path";
+import { platform } from "node:os";
+import { pathToFileURL } from "node:url";
 import { createHash } from "node:crypto";
 import type { ContentBlock } from "@agentclientprotocol/sdk";
 import { sanitizedError } from "./redact.js";
 import { messageSafeRandom } from "./utils.js";
+import { normalizeSupportedPlatform, type SupportedHostPlatform } from "./platform-security.js";
 
 export interface PromptCapabilities {
   image?: boolean;
@@ -39,6 +42,7 @@ export interface InboxFile {
   fileIno: bigint;
   sha256: string;
   descriptorFd: number | null;
+  hostPlatform: SupportedHostPlatform;
 }
 
 export interface RootIdentity {
@@ -161,12 +165,15 @@ export function isAllowedMime(mime: string, allowlist: string[]): boolean {
 interface InboxDirectoryHandle {
   fd: number;
   dir: string;
-  descriptorPath: string;
+  accessPath: string;
   dev: bigint;
   ino: bigint;
 }
 
-function openInboxDirectory(root: RootIdentity): InboxDirectoryHandle {
+function openInboxDirectory(
+  root: RootIdentity,
+  hostPlatform: SupportedHostPlatform,
+): InboxDirectoryHandle {
   validateRootIdentity(root);
   const dir = join(root.path, ".tg-inbox");
   mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -182,12 +189,12 @@ function openInboxDirectory(root: RootIdentity): InboxDirectoryHandle {
       throw new Error("Inbox directory identity changed");
     }
     fchmodSync(fd, 0o700);
-    const descriptorPath = `/proc/self/fd/${fd}`;
-    if (realpathSync(descriptorPath) !== dir) {
-      throw new Error("Inbox directory is not bound to the authorized CWD");
+    const accessPath = hostPlatform === "linux" ? `/proc/self/fd/${fd}` : dir;
+    if (realpathSync(accessPath) !== dir) {
+      throw new Error("Inbox directory is not bound to its authorized path");
     }
     validateRootIdentity(root);
-    return { fd, dir, descriptorPath, dev: opened.dev, ino: opened.ino };
+    return { fd, dir, accessPath, dev: opened.dev, ino: opened.ino };
   } catch (error: unknown) {
     closeSync(fd);
     throw error;
@@ -195,7 +202,7 @@ function openInboxDirectory(root: RootIdentity): InboxDirectoryHandle {
 }
 
 function writeInboxGitignore(handle: InboxDirectoryHandle): void {
-  const path = join(handle.descriptorPath, ".gitignore");
+  const path = join(handle.accessPath, ".gitignore");
   const fd = openSync(
     path,
     constants.O_WRONLY | constants.O_CREAT | constants.O_NOFOLLOW,
@@ -214,8 +221,11 @@ function writeInboxGitignore(handle: InboxDirectoryHandle): void {
   }
 }
 
-export function ensureInboxDir(root: RootIdentity): string {
-  const handle = openInboxDirectory(root);
+export function ensureInboxDir(
+  root: RootIdentity,
+  hostPlatformInput: NodeJS.Platform = platform(),
+): string {
+  const handle = openInboxDirectory(root, normalizeSupportedPlatform(hostPlatformInput));
   try {
     writeInboxGitignore(handle);
     return handle.dir;
@@ -230,9 +240,18 @@ export function safeInboxFileName(originalName: string): string {
   return `${messageSafeRandom().slice(0, 10)}_${safe}`;
 }
 
+function validateDarwinInboxFilePath(file: InboxFile): void {
+  const current = lstatSync(file.path, { bigint: true });
+  if (current.isSymbolicLink() || !current.isFile() || current.nlink !== 1n
+    || current.dev !== file.fileDev || current.ino !== file.fileIno
+    || current.size !== BigInt(file.size) || realpathSync(file.path) !== file.path) {
+    throw new Error("Inbox file path identity changed after admission");
+  }
+}
+
 function readInboxFile(file: InboxFile): Buffer {
   const root: RootIdentity = { path: file.rootPath, dev: file.rootDev, ino: file.rootIno };
-  const handle = openInboxDirectory(root);
+  const handle = openInboxDirectory(root, file.hostPlatform);
   try {
     if (handle.dev !== file.inboxDev || handle.ino !== file.inboxIno) {
       throw new Error("Inbox directory identity changed after admission");
@@ -244,6 +263,7 @@ function readInboxFile(file: InboxFile): Buffer {
       || opened.size !== BigInt(file.size)) {
       throw new Error("Inbox file identity changed after admission");
     }
+    if (file.hostPlatform === "darwin") validateDarwinInboxFilePath(file);
     const data = Buffer.alloc(file.size);
     let offset = 0;
     while (offset < data.length) {
@@ -274,32 +294,33 @@ export function buildPromptBlocks(options: {
 
   for (const file of options.files) {
     const buf = readInboxFile(file);
-    const descriptorPath = file.descriptorFd === null
-      ? null
-      : `/proc/${process.pid}/fd/${file.descriptorFd}`;
-    if (!descriptorPath) throw new Error("Inbox file descriptor is no longer available");
+    if (file.descriptorFd === null) throw new Error("Inbox file descriptor is no longer available");
+    const attachmentPath = file.hostPlatform === "linux"
+      ? `/proc/${process.pid}/fd/${file.descriptorFd}`
+      : file.path;
+    const attachmentUri = pathToFileURL(attachmentPath).href;
     const b64 = buf.toString("base64");
     if (isImageMime(file.mime) && options.capabilities.image) {
       blocks.push({
         type: "image",
         data: b64,
         mimeType: file.mime,
-        uri: `file://${descriptorPath}`,
+        uri: attachmentUri,
       });
-      notes.push(`Attached image: ${file.originalName} (${descriptorPath})`);
+      notes.push(`Attached image: ${file.originalName} (${attachmentPath})`);
     } else if (isAudioMime(file.mime) && options.capabilities.audio) {
       blocks.push({
         type: "audio",
         data: b64,
         mimeType: file.mime,
       });
-      notes.push(`Attached audio: ${file.originalName} (${descriptorPath})`);
+      notes.push(`Attached audio: ${file.originalName} (${attachmentPath})`);
     } else if (options.capabilities.embeddedContext) {
       if (file.mime.startsWith("text/") || file.mime === "application/json") {
         blocks.push({
           type: "resource",
           resource: {
-            uri: `file://${descriptorPath}`,
+            uri: attachmentUri,
             mimeType: file.mime,
             text: buf.toString("utf8").slice(0, 200_000),
           },
@@ -308,24 +329,24 @@ export function buildPromptBlocks(options: {
         blocks.push({
           type: "resource",
           resource: {
-            uri: `file://${descriptorPath}`,
+            uri: attachmentUri,
             mimeType: file.mime,
             blob: b64,
           },
         });
       }
-      notes.push(`Embedded resource: ${file.originalName} (${descriptorPath})`);
+      notes.push(`Embedded resource: ${file.originalName} (${attachmentPath})`);
     } else {
       // Baseline: resource_link + path in text so agent can open via tools
       blocks.push({
         type: "resource_link",
         name: file.originalName,
-        uri: `file://${descriptorPath}`,
+        uri: attachmentUri,
         mimeType: file.mime,
         size: file.size,
-        description: `Telegram attachment saved at ${descriptorPath}`,
+        description: `Telegram attachment saved at ${attachmentPath}`,
       });
-      notes.push(`Attachment saved for tools: ${descriptorPath}`);
+      notes.push(`Attachment saved for tools: ${attachmentPath}`);
     }
   }
 
@@ -372,10 +393,12 @@ export function writeInboxFile(
   root: RootIdentity,
   originalName: string,
   data: Buffer,
+  hostPlatformInput: NodeJS.Platform = platform(),
 ): InboxFile {
-  const handle = openInboxDirectory(root);
+  const hostPlatform = normalizeSupportedPlatform(hostPlatformInput);
+  const handle = openInboxDirectory(root, hostPlatform);
   const name = safeInboxFileName(originalName);
-  const descriptorPath = join(handle.descriptorPath, name);
+  const descriptorPath = join(handle.accessPath, name);
   const path = join(handle.dir, name);
   let fd: number | null = null;
   let retained = false;
@@ -409,7 +432,9 @@ export function writeInboxFile(
       fileIno: opened.ino,
       sha256: createHash("sha256").update(data).digest("hex"),
       descriptorFd: fd,
+      hostPlatform,
     };
+    if (hostPlatform === "darwin") validateDarwinInboxFilePath(result);
     retained = true;
     return result;
   } catch (error: unknown) {

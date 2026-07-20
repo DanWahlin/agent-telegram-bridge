@@ -1,7 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { Readable, Writable } from "node:stream";
-import { statSync } from "node:fs";
-import { platform } from "node:os";
 import * as acp from "@agentclientprotocol/sdk";
 import type {
   ContentBlock,
@@ -26,6 +24,9 @@ import {
   type PendingPermissionState,
 } from "./state.js";
 import type { PromptCapabilities, RootIdentity } from "./media.js";
+import { verifyProcessCwdIdentity } from "./platform-security.js";
+
+export { verifyProcessCwdIdentity } from "./platform-security.js";
 
 export interface PermissionRequest {
   sessionId: string;
@@ -55,20 +56,6 @@ export interface AcpClientHandle {
   getPromptCapabilities: () => PromptCapabilities;
   setCwd: (cwd: string) => void;
   getCwd: () => string;
-}
-
-export function verifyProcessCwdIdentity(
-  pid: number | undefined,
-  expected: RootIdentity,
-): void {
-  if (platform() !== "linux") {
-    throw new Error("Secure ACP child CWD verification requires Linux /proc");
-  }
-  if (!pid) throw new Error("ACP child PID is unavailable");
-  const actual = statSync(`/proc/${pid}/cwd`, { bigint: true });
-  if (!actual.isDirectory() || actual.dev !== expected.dev || actual.ino !== expected.ino) {
-    throw new Error("ACP child started outside the authorized CWD identity");
-  }
 }
 
 async function exitsWithin(exited: Promise<void>, timeoutMs: number): Promise<boolean> {
