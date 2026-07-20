@@ -166,8 +166,10 @@ describe("pairing and state hardening", () => {
         parentPort.postMessage(String(error && error.message));
       }
     `, { eval: true, workerData: addonPath });
-    const [message] = await once(worker, "message") as [string];
-    await once(worker, "exit");
+    const messagePromise = once(worker, "message") as Promise<[string]>;
+    const exitPromise = once(worker, "exit");
+    const [message] = await messagePromise;
+    await exitPromise;
     expect(message).toMatch(/primary Node environment/);
   });
 
